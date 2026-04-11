@@ -14,7 +14,7 @@ Write-Host "=================================================" -ForegroundColor 
 
 # Step 1: Start Redis via Docker Compose
 Write-Host ""
-Write-Host "[1/4] Starting Redis (Docker)..." -ForegroundColor Yellow
+Write-Host "[1/5] Starting Redis (Docker)..." -ForegroundColor Yellow
 docker compose up -d redis
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Failed to start Redis via Docker. Is Docker running?" -ForegroundColor Red
@@ -44,7 +44,7 @@ Write-Host "      Redis is ready!" -ForegroundColor Green
 
 # Step 2: Start Celery Worker
 Write-Host ""
-Write-Host "[2/4] Starting Celery Worker..." -ForegroundColor Yellow
+Write-Host "[2/5] Starting Celery Worker..." -ForegroundColor Yellow
 $celery = Start-Process -PassThru -FilePath "python" `
     -ArgumentList "-m celery -A app.core.celery_app worker --loglevel=info --pool=solo" `
     -WorkingDirectory $BackendDir `
@@ -58,9 +58,25 @@ if ($celery.HasExited) {
 }
 Write-Host "      Celery worker PID: $($celery.Id)" -ForegroundColor Green
 
-# Step 3: Start Backend (Uvicorn)
+# Step 3: Start Celery Beat (Scheduler - Required for scheduled campaigns)
 Write-Host ""
-Write-Host "[3/4] Starting Backend API (uvicorn)..." -ForegroundColor Yellow
+Write-Host "[3/5] Starting Celery Beat (Scheduler)..." -ForegroundColor Yellow
+$beat = Start-Process -PassThru -FilePath "python" `
+    -ArgumentList "-m celery -A app.core.celery_app beat --loglevel=info" `
+    -WorkingDirectory $BackendDir `
+    -WindowStyle Normal
+
+Start-Sleep 3
+
+if ($beat.HasExited) {
+    Write-Host "WARNING: Celery Beat exited early (exit code $($beat.ExitCode)). Scheduled campaigns may not fire." -ForegroundColor Yellow
+} else {
+    Write-Host "      Celery Beat PID: $($beat.Id) (Checks for scheduled campaigns every 60s)" -ForegroundColor Green
+}
+
+# Step 4: Start Backend (Uvicorn)
+Write-Host ""
+Write-Host "[4/5] Starting Backend API (uvicorn)..." -ForegroundColor Yellow
 $backend = Start-Process -PassThru -FilePath "python" `
     -ArgumentList "-m uvicorn main:app --port 8000" `
     -WorkingDirectory $BackendDir `
@@ -91,9 +107,9 @@ if (-not $backendReady) {
     Write-Host "      Backend is ready! (took $waited sec)" -ForegroundColor Green
 }
 
-# Step 4: Start Frontend
+# Step 5: Start Frontend
 Write-Host ""
-Write-Host "[4/4] Starting Frontend (npm run dev)..." -ForegroundColor Yellow
+Write-Host "[5/5] Starting Frontend (npm run dev)..." -ForegroundColor Yellow
 $frontend = Start-Process -PassThru -FilePath "cmd" `
     -ArgumentList "/c npm run dev" `
     -WorkingDirectory $FrontendDir `
@@ -105,11 +121,11 @@ Write-Host ""
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host "  ALL SERVICES STARTED" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Cyan
-Write-Host "  Redis      : redis://127.0.0.1:6379" -ForegroundColor White
-Write-Host "  Celery      : PID $($celery.Id)" -ForegroundColor White
-Write-Host "  Backend API : http://localhost:8000" -ForegroundColor White
-Write-Host "  Frontend    : http://localhost:3000" -ForegroundColor White
-Write-Host "  Redis UI    : http://localhost:8081" -ForegroundColor White
+Write-Host "  Redis        : redis://127.0.0.1:6379" -ForegroundColor White
+Write-Host "  Celery Worker: PID $($celery.Id)" -ForegroundColor White
+Write-Host "  Celery Beat  : PID $($beat.Id)  <-- Runs scheduled campaigns" -ForegroundColor White
+Write-Host "  Backend API  : http://localhost:8000" -ForegroundColor White
+Write-Host "  Frontend     : http://localhost:3000" -ForegroundColor White
 Write-Host ""
 Write-Host "  To stop all: Close the opened windows" -ForegroundColor Gray
 Write-Host "=================================================" -ForegroundColor Cyan

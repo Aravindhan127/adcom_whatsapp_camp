@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Request, Depends, Query, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from passlib.context import CryptContext
 from typing import Optional
 from uuid import UUID
 from sqlalchemy.orm import Session
@@ -28,6 +27,12 @@ any_agent = get_current_user
 
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
+
+def normalize_wa_id(wa_id: str) -> str:
+    """Normalize phone number to always start with + for consistency."""
+    if wa_id and not wa_id.startswith('+'):
+        return f'+{wa_id}'
+    return wa_id
 
 @router.get("/webhook")
 async def whatsapp_verify(
@@ -83,7 +88,7 @@ async def receive_whatsapp(request: Request, db: Session = Depends(get_db)):
         return {"status": "no messages"}
         
     msg = messages[0]
-    wa_id = msg["from"]
+    wa_id = normalize_wa_id(msg["from"])
     meta_message_id = msg.get("id")
     msg_type = msg.get("type", "text")
     
@@ -142,9 +147,15 @@ def list_conversations(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    # Base subquery: Get the latest conversation ID for each phone number
-    # This ensures "one number, one time" in the sidebar
-    latest_conv_ids_subquery = db.query(func.max(WhatsAppConversation.id)).group_by(WhatsAppConversation.wa_id)
+    # Base subquery: Get the latest conversation ID for each NORMALIZED phone number
+    # This ensures "one number, one time" even if stored with/without + prefix
+    from sqlalchemy import case
+    # Normalize wa_id in the subquery grouping
+    normalized_wa_id = func.replace(WhatsAppConversation.wa_id, ' ', '')
+    # We group by the normalized form to collapse +91xxx and 91xxx as same
+    latest_conv_ids_subquery = db.query(func.max(WhatsAppConversation.id)).group_by(
+        func.ltrim(WhatsAppConversation.wa_id, '+')
+    )
     
     query = db.query(WhatsAppConversation).filter(WhatsAppConversation.id.in_(latest_conv_ids_subquery))
     
@@ -174,7 +185,7 @@ def list_conversations(
             
         enriched.append({
             "sessionId": str(conv.id),
-            "phoneNumber": conv.wa_id,
+            "phoneNumber": normalize_wa_id(conv.wa_id),
             "lastMessage": last_msg.message if last_msg else "No messages",
             "timestamp": last_msg.created_at.isoformat() if last_msg else conv.started_at.isoformat(),
             "unreadCount": 0,
@@ -193,7 +204,12 @@ def get_conversation_messages(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    messages = db.query(WhatsAppMessage).filter(WhatsAppMessage.wa_id == wa_id).order_by(WhatsAppMessage.created_at.desc()).offset(skip).limit(limit).all()
+    # Normalize wa_id and also search both +91xxx and 91xxx formats
+    wa_id_normalized = normalize_wa_id(wa_id)
+    wa_id_no_plus = wa_id_normalized.lstrip('+')
+    messages = db.query(WhatsAppMessage).filter(
+        WhatsAppMessage.wa_id.in_([wa_id_normalized, wa_id_no_plus])
+    ).order_by(WhatsAppMessage.created_at.desc()).offset(skip).limit(limit).all()
     
     formatted = [{
         "id": str(m.id),
@@ -214,7 +230,7 @@ async def send_message_route(
     current_user: Agent = Depends(any_agent)
 ):
     data = await request.json()
-    to = data.get("to")
+    to = normalize_wa_id(data.get("to", ""))
     text = data.get("message")
 
     if not to or not text:
