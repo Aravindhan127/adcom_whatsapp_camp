@@ -1,0 +1,103 @@
+# ============================================================
+# SENSITIVE FILES - NEVER COMMIT THESE
+# ============================================================
+.env
+.env.local
+.env.production
+.env.*.local
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyc
+*.pyo
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================================
+# Logs & Debug files
+# ============================================================
+*.log
+*.txt
+!requirements.txt
+!README.md
+!project_task_list.csv
+debug_*.py
+debug_dump.json
+output.txt
+batch_result.txt
+campaign_id.txt
+query
+server_error.log
+schemas.log
+worker_output.log
+
+# ============================================================
+# Database files
+# ============================================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================================
+# Node / React / Frontend
+# ============================================================
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/out/
+.npm
+*.tsbuildinfo
+frontend/node_modules/
+
+# ============================================================
+# Temporary / scratch files
+# ============================================================
+tmp/
+temp/
+backend/tmp/
+backend/temp_media/
+backend/scratch/
+*.tmp
+
+# ============================================================
+# OS files
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============================================================
+# Docker
+# ============================================================
+# (docker-compose.yml is kept — override files excluded)
+docker-compose.override.yml
+
+# ============================================================
+# SKILLS folder (internal AI context)
+# ============================================================
+SKILLS/

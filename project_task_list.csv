@@ -1,0 +1,30 @@
+Module,Task Description,Priority,Status,Platform
+Authentication & Profile,Implement secure JWT token management and session refresh,High,Pending,Backend
+Authentication & Profile,Complete Password Reset email delivery and verification flow,High,In Progress,Backend/Frontend
+Authentication & Profile,"Add user profile management (avatar, personal details)",Medium,Pending,Frontend
+Authentication & Profile,"Implement role-based access control (Admin, Manager, Agent)",High,Pending,Backend
+WhatsApp Templates,Automated Meta Template synchronization (Sync/Pull),High,Completed,Backend
+WhatsApp Templates,Robust template deletion with Meta API validation,High,Completed,Backend
+WhatsApp Templates,Template preview with dynamic variable injection,Medium,Pending,Frontend
+WhatsApp Templates,Categorized template search and filtering,Low,Pending,Frontend
+Contact Management,Bulk contact import from Excel/CSV with mapping,High,In Progress,Backend/Frontend
+Contact Management,Advanced segmentation logic (Groups/Labels),High,Pending,Backend/Frontend
+Contact Management,Custom field management for personalized messaging,Medium,Pending,Backend
+Contact Management,Duplicate contact detection and merging tool,Low,Pending,Backend
+Campaign Operations,Scalable message dispatching using Celery background workers,High,Completed,Backend
+Campaign Operations,Campaign scheduling and recurrence engine,Medium,Pending,Backend
+Campaign Operations,Real-time campaign progress tracking (Sent/Failed counts),High,In Progress,Frontend
+Campaign Operations,Retry mechanism for failed messages during campaign,Medium,Pending,Backend
+Conversations (Inbox),Real-time chat integration using WebSockets,High,Pending,Backend/Frontend
+Conversations (Inbox),Unified inbox for WhatsApp and other channels,High,In Progress,Frontend
+Conversations (Inbox),"Media support (Images, Documents, Voice) in chat",Medium,Pending,Frontend/Backend
+Conversations (Inbox),Message search and chat archiving,Low,Pending,Frontend
+Analytics & Reporting,Dashboard overview of message delivery statistics,Medium,In Progress,Frontend
+Analytics & Reporting,Detailed campaign performance reports (Delivery/Read rates),Medium,Pending,Backend
+Analytics & Reporting,Exportable PDF/Excel reports for campaign metrics,Low,Pending,Backend
+Mobile App (Android),Responsiveness optimization for RecordTable (Tamil/English),High,Completed,Mobile
+Mobile App (Android),Final Release APK generation and asset bundling fix,High,Completed,Mobile
+Mobile App (Android),Push notification integration for new messages,High,Pending,Mobile
+Infrastructure & DevOps,Docker containerization for production deployment,High,In Progress,DevOps
+Infrastructure & DevOps,System log rotation and centralized monitoring,Medium,Pending,DevOps
+Infrastructure & DevOps,Database backup and disaster recovery automation,High,Pending,DevOps
