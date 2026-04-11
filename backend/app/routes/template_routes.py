@@ -12,6 +12,8 @@ from app.core.security import get_current_user, RoleChecker
 from app.models.agent import Agent
 from app.models.campaign import Campaign
 
+import re
+
 logger = logging.getLogger("adcom-api")
 
 # Access control workers
@@ -19,6 +21,24 @@ admin_only = RoleChecker(["admin"])
 any_agent = get_current_user
 
 router = APIRouter(prefix="/templates", tags=["Templates"])
+
+def validate_template_body(components: list):
+    """
+    Validates that no BODY component text ends with a variable placeholder like {{1}}.
+    Meta rejects templates where the body ends with a variable — text must follow.
+    """
+    for comp in components:
+        if comp.get("type", "").upper() == "BODY":
+            body_text = comp.get("text", "").strip()
+            if re.search(r"\{\{\d+\}\}$", body_text):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Invalid template body: Message cannot end with a variable like {{1}}. "
+                        "Please add text after the last variable. "
+                        'Example: \'Hi {{1}}, welcome!\' \u2705 | Invalid: \'Hi {{1}}\' \u274c'
+                    )
+                )
 
 def check_template_in_use(db: Session, template_name: str) -> bool:
     """
@@ -50,6 +70,9 @@ def create_template(
     existing = db.query(WhatsAppTemplate).filter(WhatsAppTemplate.name == template_in.name).first()
     if existing:
         raise HTTPException(status_code=400, detail="Template name already exists")
+    
+    # Validate: body must not end with a variable
+    validate_template_body(template_in.components)
     
     meta_id = None
     status = "LOCAL_ONLY"
@@ -230,7 +253,10 @@ def update_template(
             detail=f"Cannot edit template '{template.name}' because it is in use by an ACTIVE campaign."
         )
 
-    # 2. Delete from Meta if applicable
+    # 2. Validate: body must not end with a variable
+    validate_template_body(template_in.components)
+
+    # 3. Delete from Meta if applicable
     if template.status != "LOCAL_ONLY":
         delete_meta_template(template.name, language=template.language)
 

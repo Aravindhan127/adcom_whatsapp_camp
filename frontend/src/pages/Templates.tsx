@@ -300,6 +300,14 @@ const Templates: React.FC = () => {
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // ✅ Validation: Body must NOT end with a variable like {{1}}
+    const trimmedBody = newBody.trim();
+    if (/\{\{\d+\}\}$/.test(trimmedBody)) {
+      alert('⚠️ Invalid Template Body\n\nYour message cannot end with a variable like {{1}}.\nPlease add some text after the variable.\n\nExample: "Hi {{1}}, welcome!" ✅\nInvalid:  "Hi {{1}}" ❌');
+      return;
+    }
+
     setIsSubmitting(true);
     try {
       const components = [];
