@@ -21,10 +21,41 @@ import {
   ExternalLink,
   MessageSquare,
   Trash2,
-  AlertCircle
+  AlertCircle,
+  ChevronUp,
+  ChevronDown,
+  ArrowUpDown,
+  Eye,
+  ChevronLeft
 } from 'lucide-react';
+
+function SortHeader({ label, column, currentSort, onSort }: { label: string; column: string; currentSort: any; onSort: (col: string) => void }) {
+    const isActive = currentSort.column === column;
+    return (
+        <th 
+            className="px-5 py-4 bg-white dark:bg-slate-900 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-slate-800 transition-colors group"
+            onClick={() => onSort(column)}
+        >
+            <div className="flex items-center justify-between gap-2 min-w-[max-content]">
+                <span className={`text-[10px] font-black uppercase tracking-wider ${isActive ? 'text-indigo-600' : 'text-slate-400'}`}>
+                    {label}
+                </span>
+                <div className={`flex-shrink-0 transition-opacity ${isActive ? 'text-indigo-600 opacity-100' : 'text-slate-300 opacity-40 group-hover:opacity-100'}`}>
+                    {isActive ? (
+                        currentSort.order === 'asc' ? <ChevronUp size={14} className="stroke-[3px]" /> : <ChevronDown size={14} className="stroke-[3px]" />
+                    ) : (
+                        <ArrowUpDown size={12} />
+                    )}
+                </div>
+            </div>
+        </th>
+    );
+}
+
 import { whatsappApi, Template } from '../services/whatsappApi';
 import PageHeader from '../components/PageHeader';
+import { useToast } from '../components/Toast';
+import { CustomSelect } from '../components/CustomSelect';
 
 const TEMPLATE_LIBRARY = [
   {
@@ -131,7 +162,11 @@ const Templates: React.FC = () => {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [showOnlyApproved, setShowOnlyApproved] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'APPROVED' | 'PENDING' | 'REJECTED'>('ALL');
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
+  const limit = 10;
+  const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
 
   // Form State
   const [newName, setNewName] = useState('');
@@ -152,10 +187,12 @@ const Templates: React.FC = () => {
   const [isEditing, setIsEditing] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  const { error: toastError, success: toastSuccess, info: toastInfo } = useToast();
 
   // Configure Modal State
   const [configTemplate, setConfigTemplate] = useState<Template | null>(null);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
+  const [sort, setSort] = useState<{ column: string; order: 'asc' | 'desc' }>({ column: 'created_at', order: 'desc' });
 
   const contactFields = [
     { label: 'Contact Name', value: 'contact.name' },
@@ -187,8 +224,15 @@ const Templates: React.FC = () => {
   const fetchTemplates = async () => {
     setLoading(true);
     try {
-      const data = await whatsappApi.getTemplates();
-      setTemplates(data);
+      const res = await whatsappApi.getTemplates({ 
+        skip: page * limit,
+        limit,
+        status: statusFilter === 'ALL' ? undefined : statusFilter,
+        sort_by: sort.column,
+        sort_order: sort.order
+      });
+      setTemplates(res.items || []);
+      setTotal(res.total || 0);
     } catch (error) {
       console.error('Error fetching templates:', error);
     } finally {
@@ -196,17 +240,25 @@ const Templates: React.FC = () => {
     }
   };
 
+  const handleSort = (column: string) => {
+    setSort(prev => ({
+      column,
+      order: prev.column === column && prev.order === 'asc' ? 'desc' : 'asc'
+    }));
+  };
+
   useEffect(() => {
     fetchTemplates();
-  }, []);
+  }, [sort, page, statusFilter]);
 
   const filteredTemplates = useMemo(() => {
+    if (!Array.isArray(templates)) return [];
     return templates.filter(t => {
       const matchesSearch = t.name.toLowerCase().includes(searchQuery.toLowerCase());
-      const matchesStatus = showOnlyApproved ? t.status === 'APPROVED' : true;
-      return matchesSearch && matchesStatus;
+      return matchesSearch;
     });
-  }, [templates, searchQuery, showOnlyApproved]);
+  }, [templates, searchQuery]);
+
 
   const handleSync = async () => {
     setIsSyncing(true);
@@ -247,7 +299,7 @@ const Templates: React.FC = () => {
       await fetchTemplates();
     } catch (error: any) {
       const msg = error.response?.data?.detail || 'Failed to delete template';
-      alert(msg);
+      toastError('Delete Failed', msg);
     } finally {
       setLoading(false);
     }
@@ -304,7 +356,21 @@ const Templates: React.FC = () => {
     // ✅ Validation: Body must NOT end with a variable like {{1}}
     const trimmedBody = newBody.trim();
     if (/\{\{\d+\}\}$/.test(trimmedBody)) {
-      alert('⚠️ Invalid Template Body\n\nYour message cannot end with a variable like {{1}}.\nPlease add some text after the variable.\n\nExample: "Hi {{1}}, welcome!" ✅\nInvalid:  "Hi {{1}}" ❌');
+      toastError('Invalid Format', 'Your message cannot end with a variable like {{1}}. Please add some text after it.');
+      return;
+    }
+
+    // ✅ New Character Limit Validations
+    if (newBody.length > 1024) {
+      toastError('Limit Exceeded', 'Message body cannot exceed 1024 characters.');
+      return;
+    }
+    if (headerType === 'TEXT' && headerText.length > 60) {
+      toastError('Limit Exceeded', 'Header text cannot exceed 60 characters.');
+      return;
+    }
+    if (newFooter.length > 60) {
+      toastError('Limit Exceeded', 'Footer text cannot exceed 60 characters.');
       return;
     }
 
@@ -319,7 +385,7 @@ const Templates: React.FC = () => {
           header.text = headerText;
         } else {
           if (!headerUrl) {
-            alert('Please upload a header file before submitting.');
+            toastError('Media Required', 'Please upload a header file before submitting.');
             setIsSubmitting(false);
             return;
           }
@@ -381,7 +447,7 @@ const Templates: React.FC = () => {
       };
 
       if (isEditing && editId) {
-        if (!window.confirm("Editing an approved template requires deleting the old version and re-submitting for approval. New approving usually takes 1-24 hours. Continue?")) {
+        if (!window.confirm("Updating this template will submit the changes to Meta for re-approval. This process usually takes 1-24 hours. Continue?")) {
           setIsSubmitting(false);
           return;
         }
@@ -393,8 +459,12 @@ const Templates: React.FC = () => {
       setIsModalOpen(false);
       resetForm();
       fetchTemplates();
+      toastSuccess('Success', isEditing ? 'Template updated' : 'Template created and submitted to Meta');
     } catch (error: any) {
-      alert(error.response?.data?.detail || 'Failed to process template');
+      const detail = error.response?.data?.detail || 'Failed to process template';
+      // Strip common Meta error codes for more "meaningful" messages as requested
+      const humanMsg = detail.replace(/\(#\d+\)\s+/, '').replace('Invalid parameter', 'Meta rejected parameters: ');
+      toastError('Submission Error', humanMsg);
     } finally {
       setIsSubmitting(false);
     }
@@ -403,6 +473,24 @@ const Templates: React.FC = () => {
   const handleMediaUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    // ✅ Media Size Validations
+    const MAX_IMAGE = 5 * 1024 * 1024;
+    const MAX_VIDEO = 16 * 1024 * 1024;
+    const MAX_DOC = 100 * 1024 * 1024;
+
+    if (file.type.startsWith('image/') && file.size > MAX_IMAGE) {
+      toastError('File Too Large', 'Images must be under 5MB.');
+      return;
+    }
+    if (file.type.startsWith('video/') && file.size > MAX_VIDEO) {
+      toastError('File Too Large', 'Videos must be under 16MB.');
+      return;
+    }
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/') && file.size > MAX_DOC) {
+      toastError('File Too Large', 'Documents must be under 100MB.');
+      return;
+    }
 
     // Show local preview immediately
     if (file.type.startsWith('image/')) {
@@ -413,6 +501,7 @@ const Templates: React.FC = () => {
     }
 
     setIsUploadingMedia(true);
+    toastInfo('Uploading', 'Processing media for Meta approval...');
     try {
       // 1. Upload for Meta Template Approval (Resumable Session) -> gets `handle`
       const res = await whatsappApi.uploadTemplateMedia(file);
@@ -421,8 +510,9 @@ const Templates: React.FC = () => {
       // 2. Upload for Actual Campaign Sending (Direct Upload) -> gets `media_id`
       const campaignMediaRes = await whatsappApi.uploadCampaignMedia(file);
       setMediaId(campaignMediaRes.id);
+      toastSuccess('Media Ready', 'File uploaded and synced.');
     } catch (error: any) {
-      alert(`Upload failed: ${error.response?.data?.detail || error.message}`);
+      toastError('Upload Failed', error.response?.data?.detail || error.message);
     } finally {
       setIsUploadingMedia(false);
     }
@@ -494,8 +584,15 @@ const Templates: React.FC = () => {
             <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Search templates..." className="w-full md:w-80 pl-10 pr-4 py-2 bg-slate-50 dark:bg-slate-800 border-none rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 transition-all" />
           </div>
           <div className="flex bg-slate-50 dark:bg-slate-800 p-1 rounded-lg">
-            <button onClick={() => setShowOnlyApproved(false)} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${!showOnlyApproved ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}>All</button>
-            <button onClick={() => setShowOnlyApproved(true)} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${showOnlyApproved ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}>Approved</button>
+            {(['ALL', 'APPROVED', 'PENDING', 'REJECTED'] as const).map(status => (
+                <button 
+                  key={status}
+                  onClick={() => setStatusFilter(status)} 
+                  className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${statusFilter === status ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+                >
+                  {status === 'ALL' ? 'All' : status.charAt(0) + status.slice(1).toLowerCase()}
+                </button>
+            ))}
           </div>
         </div>
         <div className="hidden md:flex items-center gap-6 text-center">
@@ -516,49 +613,92 @@ const Templates: React.FC = () => {
           <p className="text-slate-500 font-bold">No templates found</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {filteredTemplates.map(template => (
-            <div key={template.id} className="bg-white dark:bg-slate-900 p-6 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col hover:border-indigo-500 transition-all group overflow-hidden">
-              <div className="flex justify-between items-start mb-6">
-                {getStatusBadge(template.status)}
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{template.category}</span>
-              </div>
-              <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-4 line-clamp-1">{template.name.replace(/_/g, ' ')}</h3>
-
-              {template.status === 'REJECTED' && template.rejection_reason && (
-                <div className="mb-4 p-2 bg-rose-50 dark:bg-rose-500/10 border border-rose-100 dark:border-rose-500/20 rounded-lg text-[10px] text-rose-600 font-bold italic line-clamp-2">
-                  Reason: {template.rejection_reason}
-                </div>
-              )}
-
-              <div className="flex-1 bg-slate-50 dark:bg-slate-800/50 p-4 rounded-lg border border-slate-100 dark:border-slate-700/50 mb-6 font-mono text-xs text-slate-600 dark:text-slate-400 line-clamp-4 leading-relaxed group-hover:line-clamp-none transition-all">
-                {template.components.find(c => c.type === 'HEADER' && c.format === 'TEXT')?.text && (
-                  <span className="block font-bold mb-1">[H] {template.components.find(c => c.type === 'HEADER' && c.format === 'TEXT')?.text}</span>
-                )}
-                {template.components.find(c => c.type === 'BODY')?.text || 'No content'}
-              </div>
-
-              <div className="flex gap-2 mb-4 opacity-0 group-hover:opacity-100 transition-all translate-y-2 group-hover:translate-y-0 text-[10px] font-bold uppercase">
-                <button onClick={() => {
-                  setConfigTemplate(template);
-                  setVariableMappings((template as any).variable_mappings || {});
-                  setMediaId((template as any).media_id || '');
-                  setIsConfigModalOpen(true);
-                }} className="flex-1 flex items-center justify-center gap-1 py-1.5 px-3 bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 rounded-lg hover:bg-indigo-100"><Layers size={12} /> Config</button>
-                <button onClick={() => handleEdit(template)} className="flex-1 flex items-center justify-center gap-1 py-1.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 rounded-lg hover:bg-slate-200"><RefreshCw size={12} /> Edit</button>
-                <button onClick={() => handleDelete(template.id, template.name)} className="flex items-center justify-center p-1.5 bg-rose-50 dark:bg-rose-500/10 text-rose-600 rounded-lg hover:bg-rose-100 transition-all active:scale-95"><Trash2 size={14} /></button>
-              </div>
-
-              <div className="pt-4 border-t border-slate-50 dark:border-slate-800 flex justify-between items-center text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                <span className="flex items-center gap-1">
-                  {template.components.some(c => c.type === 'HEADER' && c.format !== 'TEXT') && <ImageIcon size={10} />}
-                  {template.components.some(c => c.type === 'BUTTONS') && <Zap size={10} />}
-                  {template.language}
-                </span>
-                {template.last_synced_at && <span>Synced {new Date(template.last_synced_at).toLocaleDateString()}</span>}
-              </div>
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white">Blueprint Library</h3>
             </div>
-          ))}
+            <div className="h-[60vh] overflow-auto custom-scrollbar relative">
+                <table className="w-full text-left text-sm">
+                    <thead className="sticky top-0 z-10 bg-white dark:bg-slate-900 shadow-sm">
+                        <tr className="border-b border-slate-100 dark:border-slate-800 text-[10px] font-black text-slate-400 uppercase tracking-[0.15em] whitespace-nowrap">
+                            <SortHeader label="Status" column="status" currentSort={sort} onSort={handleSort} />
+                            <SortHeader label="Template Name" column="name" currentSort={sort} onSort={handleSort} />
+                            <SortHeader label="Category" column="category" currentSort={sort} onSort={handleSort} />
+                            <SortHeader label="Language" column="language" currentSort={sort} onSort={handleSort} />
+                            <SortHeader label="Created" column="created_at" currentSort={sort} onSort={handleSort} />
+                            <SortHeader label="Last Synced" column="last_synced_at" currentSort={sort} onSort={handleSort} />
+                            <th className="px-5 py-4 bg-white dark:bg-slate-900 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+                        {filteredTemplates.map(template => (
+                            <tr key={template.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30 transition-colors group whitespace-nowrap font-bold">
+                                <td className="px-5 py-3">
+                                    {getStatusBadge(template.status)}
+                                </td>
+                                <td className="px-5 py-3">
+                                    <div className="flex flex-col">
+                                        <span className="text-slate-900 dark:text-white capitalize">{template.name.replace(/_/g, ' ')}</span>
+                                        {template.status === 'REJECTED' && template.rejection_reason && (
+                                            <span className="text-[10px] text-rose-500 font-medium italic mt-0.5 max-w-[200px] truncate" title={template.rejection_reason}>
+                                                Reason: {template.rejection_reason}
+                                            </span>
+                                        )}
+                                    </div>
+                                </td>
+                                <td className="px-5 py-3">
+                                    <span className="text-[11px] px-2 py-0.5 bg-slate-100 dark:bg-slate-800 text-slate-500 rounded font-black uppercase">{template.category}</span>
+                                </td>
+                                <td className="px-5 py-3 text-slate-500 dark:text-slate-400 font-mono text-xs">
+                                    {template.language}
+                                </td>
+                                <td className="px-5 py-3 text-slate-500 dark:text-slate-400 tabular-nums">
+                                    {new Date(template.created_at || '').toLocaleDateString()}
+                                </td>
+                                <td className="px-5 py-3 text-slate-400 dark:text-slate-500 tabular-nums font-medium">
+                                    {template.last_synced_at ? new Date(template.last_synced_at).toLocaleDateString() : '-'}
+                                </td>
+                                <td className="px-5 py-3">
+                                    <div className="flex justify-end gap-2">
+                                        <button onClick={() => setPreviewTemplate(template)} className="p-1.5 bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 rounded-lg hover:bg-indigo-100 transition-all shadow-sm" title="Preview"><Eye size={14} /></button>
+                                        <button onClick={() => {
+                                            setConfigTemplate(template);
+                                            setVariableMappings((template as any).variable_mappings || {});
+                                            setMediaId((template as any).media_id || '');
+                                            setIsConfigModalOpen(true);
+                                        }} className="p-1.5 bg-slate-50 dark:bg-slate-500/10 text-slate-600 dark:text-slate-400 rounded-lg hover:bg-slate-100 transition-all shadow-sm" title="Configure"><Layers size={14} /></button>
+                                        <button onClick={() => handleEdit(template)} className="p-1.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 rounded-lg hover:bg-slate-200 transition-all shadow-sm" title="Edit"><RefreshCw size={14} /></button>
+                                        <button onClick={() => handleDelete(template.id, template.name)} className="p-1.5 bg-rose-50 dark:bg-rose-500/10 text-rose-600 rounded-lg hover:bg-rose-100 transition-all active:scale-95 shadow-sm" title="Delete"><Trash2 size={14} /></button>
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {total > 0 && (
+                <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/30">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest pl-2">
+                        Sync: {page * limit + 1} - {Math.min((page + 1) * limit, total)} of {total}
+                    </span>
+                    <div className="flex gap-2">
+                        <button 
+                            onClick={() => setPage(p => Math.max(0, p - 1))} 
+                            disabled={page === 0} 
+                            className="p-2 border border-slate-200 dark:border-slate-700 rounded-lg disabled:opacity-20 hover:bg-white transition-all shadow-sm text-slate-600 dark:text-slate-400"
+                        >
+                            <ChevronLeft size={16}/>
+                        </button>
+                        <button 
+                            onClick={() => setPage(p => p + 1)} 
+                            disabled={(page + 1) * limit >= total} 
+                            className="p-2 border border-slate-200 dark:border-slate-700 rounded-lg disabled:opacity-20 hover:bg-white transition-all shadow-sm text-slate-600 dark:text-slate-400"
+                        >
+                            <ChevronRight size={16}/>
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
       )}
 
@@ -608,14 +748,16 @@ const Templates: React.FC = () => {
                         className="w-full p-4 bg-slate-50 dark:bg-white/5 border border-transparent rounded-2xl text-sm font-bold focus:ring-2 focus:ring-indigo-500/20 focus:bg-white dark:focus:bg-zinc-900 transition-all outline-none disabled:opacity-50"
                       />
                     </div>
-                    <div className="space-y-2">
-                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">Category</label>
-                      <select value={newCategory} onChange={e => setNewCategory(e.target.value)} className="w-full p-4 bg-slate-50 dark:bg-white/5 border border-transparent rounded-2xl text-sm font-bold focus:ring-2 focus:ring-indigo-500/20 focus:bg-white dark:focus:bg-zinc-900 transition-all outline-none cursor-pointer">
-                        <option value="MARKETING">Marketing (Promotional)</option>
-                        <option value="UTILITY">Utility (Transactional)</option>
-                        <option value="AUTHENTICATION">Authentication (OTP)</option>
-                      </select>
-                    </div>
+                      <CustomSelect
+                        label="Category"
+                        value={newCategory}
+                        onChange={setNewCategory}
+                        options={[
+                          { value: "MARKETING", label: "Marketing (Promotional)" },
+                          { value: "UTILITY", label: "Utility (Transactional)" },
+                          { value: "AUTHENTICATION", label: "Authentication (OTP)" },
+                        ]}
+                      />
                   </div>
                 </div>
 
@@ -641,8 +783,12 @@ const Templates: React.FC = () => {
                   </div>
 
                   {headerType === 'TEXT' && (
-                    <div className="animate-in fade-in slide-in-from-top-2 duration-300">
-                      <input value={headerText} onChange={e => setHeaderText(e.target.value)} placeholder="Header text..." className="w-full p-4 bg-indigo-50/30 dark:bg-indigo-500/5 border border-indigo-100 dark:border-indigo-500/20 rounded-2xl text-sm font-bold outline-none focus:ring-2 focus:ring-indigo-500/20" />
+                    <div className="animate-in fade-in slide-in-from-top-2 duration-300 space-y-2">
+                      <div className="flex justify-between items-center px-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase">Header Text</label>
+                        <span className={`text-[10px] font-bold ${headerText.length > 60 ? 'text-rose-500' : 'text-slate-400'}`}>{headerText.length}/60</span>
+                      </div>
+                      <input value={headerText} onChange={e => setHeaderText(e.target.value)} placeholder="Header title..." className={`w-full p-4 bg-indigo-50/30 dark:bg-indigo-500/5 border ${headerText.length > 60 ? 'border-rose-500' : 'border-indigo-100 dark:border-indigo-500/20'} rounded-2xl text-sm font-bold outline-none focus:ring-2 focus:ring-indigo-500/20`} />
                     </div>
                   )}
                   {(headerType === 'IMAGE' || headerType === 'VIDEO' || headerType === 'DOCUMENT') && (
@@ -670,14 +816,21 @@ const Templates: React.FC = () => {
                     </div>
                     <span className="text-[10px] text-indigo-600 dark:text-indigo-400 font-bold px-3 py-1 bg-indigo-50 dark:bg-indigo-500/10 rounded-full italic">Variables: Use {"{{1}}"}, {"{{2}}"}...</span>
                   </div>
-                  <textarea
-                    required
-                    rows={6}
-                    value={newBody}
-                    onChange={e => setNewBody(e.target.value)}
-                    placeholder="Type your message body here. Meta likes professional, clear language."
-                    className="w-full p-8 bg-slate-50 dark:bg-white/5 border border-transparent rounded-[2rem] text-sm leading-relaxed outline-none focus:ring-2 focus:ring-emerald-500/20 focus:bg-white dark:focus:bg-zinc-900 transition-all font-medium"
-                  />
+                  <div className="relative group">
+                    <textarea
+                      required
+                      rows={6}
+                      value={newBody}
+                      onChange={e => setNewBody(e.target.value)}
+                      placeholder="Type your message body here. Meta likes professional, clear language."
+                      className={`w-full p-8 bg-slate-50 dark:bg-white/5 border ${newBody.length > 1024 ? 'border-rose-500' : 'border-transparent'} rounded-[2rem] text-sm leading-relaxed outline-none focus:ring-2 focus:ring-emerald-500/20 focus:bg-white dark:focus:bg-zinc-900 transition-all font-medium`}
+                    />
+                    <div className="absolute bottom-6 right-8 flex items-center gap-2">
+                      <span className={`text-[10px] font-black px-2 py-1 rounded-md backdrop-blur-md ${newBody.length > 1024 ? 'bg-rose-500 text-white' : 'bg-emerald-500/10 text-emerald-600'}`}>
+                        {newBody.length.toLocaleString()} / 1,024
+                      </span>
+                    </div>
+                  </div>
                 </div>
 
                 {/* Section 4: Footer & Buttons */}
@@ -687,7 +840,12 @@ const Templates: React.FC = () => {
                       <div className="w-2 h-2 rounded-full bg-slate-400"></div>
                       <h3 className="text-xs font-black text-slate-900 dark:text-slate-300 uppercase tracking-[0.2em]">Footer</h3>
                     </div>
-                    <input value={newFooter} onChange={e => setNewFooter(e.target.value)} placeholder="e.g. Reply STOP to opt-out" className="w-full p-4 bg-slate-50 dark:bg-white/5 border border-transparent rounded-2xl text-sm focus:ring-2 focus:ring-slate-300/20 outline-none" />
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-center px-1">
+                        <span className={`text-[10px] font-bold ${newFooter.length > 60 ? 'text-rose-500' : 'text-slate-400'}`}>{newFooter.length}/60</span>
+                      </div>
+                      <input value={newFooter} onChange={e => setNewFooter(e.target.value)} placeholder="e.g. Reply STOP to opt-out" className={`w-full p-4 bg-slate-50 dark:bg-white/5 border ${newFooter.length > 60 ? 'border-rose-500' : 'border-transparent'} rounded-2xl text-sm focus:ring-2 focus:ring-slate-300/20 outline-none`} />
+                    </div>
                   </div>
 
                   <div className="space-y-6">
@@ -736,18 +894,16 @@ const Templates: React.FC = () => {
                           <div className="flex justify-between items-center">
                             <span className="px-3 py-1 bg-white text-indigo-600 rounded-full text-xs font-black tracking-tighter">{"{{"}{v}{"}}"}</span>
                           </div>
-                          <select
+                          <CustomSelect
                             value={variableMappings[v]?.startsWith('contact.') ? variableMappings[v] : (variableMappings[v] ? 'manual' : '')}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setVariableMappings(prev => ({ ...prev, [v]: val === 'manual' ? '' : val }));
-                            }}
-                            className="w-full p-3 bg-white/10 border border-white/20 rounded-xl text-xs font-bold outline-none text-white focus:bg-white/20 transition-all"
-                          >
-                            <option value="" className="text-slate-900">Choose Source...</option>
-                            {contactFields.map(f => <option key={f.value} value={f.value} className="text-slate-900">{f.label}</option>)}
-                            <option value="manual" className="text-slate-900">Custom Manual Text</option>
-                          </select>
+                            onChange={(val) => setVariableMappings(prev => ({ ...prev, [v]: val === 'manual' ? '' : val }))}
+                            placeholder="Choose Source..."
+                            options={[
+                              { value: "", label: "Choose Source..." },
+                              ...contactFields.map(f => ({ value: f.value, label: f.label })),
+                              { value: "manual", label: "Custom Manual Text" }
+                            ]}
+                          />
                           {(!variableMappings[v]?.startsWith('contact.') || variableMappings[v] === 'manual') && (
                             <input
                               value={variableMappings[v] || ''}
@@ -877,17 +1033,16 @@ const Templates: React.FC = () => {
                   {configTemplateVariables.map((v: string) => (
                     <div key={v} className="flex gap-3 items-center">
                       <span className="text-[10px] font-bold text-slate-500 w-12 text-center bg-slate-100 dark:bg-slate-800 p-2 rounded-lg">{"{{"}{v}{"}}"}</span>
-                      <select
+                      <CustomSelect
                         value={variableMappings[v]?.startsWith('contact.') ? variableMappings[v] : (variableMappings[v] ? 'manual' : '')}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setVariableMappings(prev => ({ ...prev, [v]: val === 'manual' ? '' : val }));
-                        }}
-                        className="p-2 bg-slate-50 dark:bg-slate-800 rounded-lg text-xs font-bold outline-none flex-1"
-                      >
-                        <option value="">Select source...</option>
-                        {contactFields.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
-                      </select>
+                        onChange={(val) => setVariableMappings(prev => ({ ...prev, [v]: val === 'manual' ? '' : val }))}
+                        placeholder="Select source..."
+                        options={[
+                          { value: "", label: "Select source..." },
+                          ...contactFields.map(f => ({ value: f.value, label: f.label })),
+                          { value: "manual", label: "Manual Text" }
+                        ]}
+                      />
                       {(!variableMappings[v]?.startsWith('contact.') || variableMappings[v] === 'manual') && (
                         <input
                           value={variableMappings[v]?.startsWith('contact.') ? '' : variableMappings[v]}
@@ -939,6 +1094,33 @@ const Templates: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Preview Modal */}
+      {previewTemplate && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="bg-white dark:bg-slate-900 rounded-3xl overflow-hidden shadow-2xl border border-slate-200 dark:border-slate-800 max-w-sm w-full scale-in-center">
+                  <div className="p-6 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-widest">Blueprint Preview</h3>
+                    <button onClick={() => setPreviewTemplate(null)} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-slate-600"><X size={20}/></button>
+                  </div>
+                  <div className="p-8 flex justify-center bg-slate-50/50 dark:bg-slate-800/50">
+                    <TemplatePreview
+                        name={previewTemplate.name}
+                        headerType={(previewTemplate.components.find((c: any) => c.type === 'HEADER')?.format || 'NONE') as any}
+                        headerText={previewTemplate.components.find((c: any) => c.type === 'HEADER')?.text || ''}
+                        headerUrl={previewTemplate.components.find((c: any) => c.type === 'HEADER')?.example?.header_handle?.[0] || previewTemplate.components.find((c: any) => c.type === 'HEADER')?.example?.header_url?.[0] || ''}
+                        body={previewTemplate.components.find((c: any) => c.type === 'BODY')?.text || ''}
+                        footer={previewTemplate.components.find((c: any) => c.type === 'FOOTER')?.text || ''}
+                        buttons={previewTemplate.components.find((c: any) => c.type === 'BUTTONS')?.buttons || []}
+                    />
+                  </div>
+                  <div className="p-4 bg-slate-50 dark:bg-slate-900 border-t border-slate-100 dark:border-slate-800">
+                    <p className="text-[10px] text-center text-slate-400 font-bold uppercase tracking-tighter">Verified Meta Snapshot</p>
+                  </div>
+              </div>
+          </div>
+      )}
+
     </div>
   );
 };

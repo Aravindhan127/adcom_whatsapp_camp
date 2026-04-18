@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Send, Search, Paperclip, Smile, MessageCircle, MoreVertical, Check, CheckCheck, AlertCircle, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { whatsappApi, type Message, type Conversation } from '../services/whatsappApi';
+import { wsService } from '../services/websocketService';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const Conversations: React.FC = () => {
@@ -58,15 +59,58 @@ const Conversations: React.FC = () => {
                 .then(setMessages)
                 .finally(() => setMessagesLoading(false));
 
-            // Poll for new messages once a conversation is selected
-            const msgInterval = setInterval(() => {
-                whatsappApi.getConversationMessages(selectedConvo.phoneNumber).then(setMessages);
-            }, 3000);
-            return () => clearInterval(msgInterval);
+            // WebSocket listener for messages in the CURRENTLY SELECTED conversation
+            const unsubscribe = wsService.subscribe('new_message', (payload) => {
+                // Use last 10 digits for matching to handle direct/formatted number variants
+                const payloadLast10 = payload.wa_id.replace(/\D/g, '').slice(-10);
+                const selectedLast10 = selectedConvo.phoneNumber.replace(/\D/g, '').slice(-10);
+                
+                if (payloadLast10 === selectedLast10) {
+                    const newMsg: Message = {
+                        id: payload.data.id,
+                        text: payload.data.text,
+                        sender: payload.data.sender,
+                        timestamp: payload.data.timestamp,
+                        type: payload.data.type || 'text',
+                        deliveryStatus: 'sent'
+                    };
+                    setMessages(prev => {
+                        if (prev.find(m => m.id === newMsg.id)) return prev;
+                        return [...prev, newMsg];
+                    });
+                }
+            });
+            return () => unsubscribe();
         } else {
             setMessages([]);
         }
     }, [selectedConvo?.sessionId]);
+
+    // WebSocket listener for updating the SIDEBAR list
+    useEffect(() => {
+        const unsubscribe = wsService.subscribe('new_message', (payload) => {
+            console.log("[WS] Sidebar update triggered:", payload);
+            setConversations(prev => {
+                const waIdClean = payload.wa_id.replace(/\D/g, '').slice(-10); // Match last 10 digits
+                const index = prev.findIndex(c => c.phoneNumber.replace(/\D/g, '').slice(-10) === waIdClean);
+                
+                if (index !== -1) {
+                    const updated = [...prev];
+                    const convo = { ...updated[index] };
+                    convo.lastMessage = payload.data.text;
+                    convo.timestamp = payload.data.timestamp;
+                    convo.contactName = payload.data.contactName || convo.contactName;
+                    
+                    updated.splice(index, 1);
+                    return [convo, ...updated];
+                } else {
+                    fetchConvos(true);
+                    return prev;
+                }
+            });
+        });
+        return () => unsubscribe();
+    }, []);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -133,11 +177,16 @@ const Conversations: React.FC = () => {
                                     : 'hover:bg-slate-100 dark:hover:bg-white/5'}`}
                         >
                             <div className="flex justify-between items-start mb-1">
-                                <h4 className="font-bold text-sm text-slate-700 dark:text-slate-200 truncate pr-2 font-mono">+{convo.phoneNumber}</h4>
+                                <h4 className="font-bold text-sm text-slate-700 dark:text-slate-200 truncate pr-2 font-mono">
+                                    {convo.contactName || `+${convo.phoneNumber}`}
+                                </h4>
                                 <span className="text-[9px] text-slate-400 font-bold uppercase shrink-0">
                                     {new Date(convo.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                 </span>
                             </div>
+                            {convo.contactName && (
+                                <p className="text-[10px] text-slate-400 font-bold mb-1">+{convo.phoneNumber}</p>
+                            )}
                             <p className="text-xs text-slate-500 truncate leading-relaxed">
                                 {convo.lastMessage || 'No messages yet'}
                             </p>
@@ -184,11 +233,23 @@ const Conversations: React.FC = () => {
                                     {selectedConvo.phoneNumber.slice(-1)}
                                 </div>
                                 <div>
-                                    <h3 className="font-bold text-slate-800 dark:text-slate-100 text-lg">+{selectedConvo.phoneNumber}</h3>
-                                    <span className="text-[10px] text-emerald-500 font-black uppercase tracking-widest flex items-center gap-1.5">
-                                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                                        Connected
-                                    </span>
+                                    <h3 className="font-bold text-slate-800 dark:text-slate-100 text-lg">
+                                        {selectedConvo.contactName || `+${selectedConvo.phoneNumber}`}
+                                    </h3>
+                                    <div className="flex items-center gap-2">
+                                        {selectedConvo.contactName && <span className="text-[10px] text-slate-400 font-bold">+{selectedConvo.phoneNumber}</span>}
+                                        {selectedConvo.isActive ? (
+                                            <span className="text-[10px] text-emerald-500 font-black uppercase tracking-widest flex items-center gap-1.5">
+                                                <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                                Session Active
+                                            </span>
+                                        ) : (
+                                            <span className="text-[10px] text-slate-400 font-black uppercase tracking-widest flex items-center gap-1.5">
+                                                <div className="w-1.5 h-1.5 rounded-full bg-slate-400" />
+                                                Session Expired
+                                            </span>
+                                        )}
+                                    </div>
                                 </div>
                             </div>
                             <div className="flex items-center gap-2">

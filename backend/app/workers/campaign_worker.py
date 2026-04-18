@@ -48,10 +48,12 @@ def check_scheduled_campaigns():
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
+        logger.info(f"Worker: Checking for scheduled campaigns... (now={now})")
         # Find campaigns that are scheduled and the time has passed
         scheduled_campaigns = db.query(Campaign).filter(
             Campaign.status == "scheduled",
-            Campaign.scheduled_at <= now
+            Campaign.scheduled_at <= now,
+            Campaign.is_deleted == False
         ).all()
 
         for campaign in scheduled_campaigns:
@@ -61,13 +63,18 @@ def check_scheduled_campaigns():
                 continue
 
             # Update status to running and start the run via service
-            from app.services.campaign_service import start_campaign_run
-            result = start_campaign_run(db, str(campaign.id))
+            # IMPORTANT: Pass scheduled_at=None so start_campaign_run_v2 is called immediately
+            # Without this, the service would re-schedule instead of launching!
+            from app.services.campaign_service import start_campaign_run_v2
+            result = start_campaign_run_v2(db, str(campaign.id))
 
             if "error" in result:
-                logger.error(f"Failed to start scheduled campaign {campaign.id}: {result['error']}")
-                # Revert status on failure so it can be retried
-                campaign.status = "scheduled"
+                error_msg = result['error']
+                logger.error(f"Failed to start scheduled campaign {campaign.id}: {error_msg}")
+                # BE-FIX: Mark as failed if it can't be started (e.g. no contacts, invalid template)
+                # This prevents endless retry loops every minute.
+                campaign.status = "failed"
+                campaign.failure_reason = error_msg
                 db.commit()
 
     except Exception as e:
@@ -109,7 +116,7 @@ def check_on_hold_campaigns():
     finally:
         db.close()
 
-@celery_app.task(name="send_campaign_batch", bind=True, max_retries=3, default_retry_delay=60)
+@celery_app.task(name="send_campaign_batch", bind=True, max_retries=3)
 def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit: int):
     """
     Processes a batch of contacts for a campaign run.
@@ -124,8 +131,20 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
         if not campaign:
             return "Campaign not found"
             
+        # BE-FIX: Abort if campaign was deleted while task was in queue
+        if campaign.is_deleted:
+            logger.warning(f"Worker: Aborting run {run_id}. Campaign {campaign_id} has been soft-deleted.")
+            run.status = "paused" # Effectively stops further batches
+            db.commit()
+            return "ABORTED: Campaign was deleted"
+            
         template = db.query(WhatsAppTemplate).filter(WhatsAppTemplate.name == campaign.template_name).first()
-        template_language = template.language if template else "en"
+        # BE-FIX BE-16: Use template's actual language with 'en_US' fallback.
+        # Previously used 'en' which is INVALID for Meta Messages API → caused error 132001.
+        template_language = template.language if template else "en_US"
+        if template_language == "en":  # Meta doesn't accept bare 'en', needs 'en_US'
+            template_language = "en_US"
+        logger.info(f"Worker: Template language resolved to '{template_language}' for '{campaign.template_name}'")
 
         # SAFETY CHECK: Ensure template exists and has components
         if template and template.components is None:
@@ -138,10 +157,11 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
         # Hardened Guard: Ensure meta_status is a dictionary before access
         if not isinstance(meta_status, dict):
             logger.error(f"Worker: Unexpected Meta response type: {type(meta_status)}. Raw: {meta_status}")
-            meta_status = {"error": "Invalid API Response Type"}
+            meta_status = {"error": str(meta_status)} # BE-FIX: was missing str() or check
 
-        if isinstance(meta_status.get("data"), list):
-            current_meta_tpl = next((t for t in meta_status["data"] if isinstance(t, dict) and t.get("name") == campaign.template_name), None)
+        meta_data = meta_status.get("data")
+        if isinstance(meta_data, list):
+            current_meta_tpl = next((t for t in meta_data if isinstance(t, dict) and t.get("name") == campaign.template_name), None)
             if current_meta_tpl and current_meta_tpl.get("status") not in ("APPROVED", "ACTIVE"):
                 error_reason = f"Meta Template Status: {current_meta_tpl.get('status')}"
                 logger.warning(f"Worker: Aborting. Template {campaign.template_name} not approved: {error_reason}")
@@ -152,7 +172,8 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                 db.commit()
                 return f"ABORTED: Template '{campaign.template_name}' is not APPROVED on Meta"
         else:
-            logger.warning(f"Worker: Could not get Meta template status: {meta_status.get('error', 'Unknown Error')}")
+            error_info = meta_status.get("error", "Unknown Error")
+            logger.warning(f"Worker: Could not get Meta template status: {error_info}")
 
         # 2. Fetch contacts for this batch
         contacts = db.query(Contact).filter(Contact.list_id == campaign.contact_list_id).offset(offset).limit(limit).all()
@@ -160,8 +181,9 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
             logger.info(f"Worker: No more contacts for campaign {campaign_id} at offset {offset}")
             return "No contacts in this batch"
 
-        logger.info(f"Worker: Starting batch for run {run_id} ({len(contacts)} contacts)")
+        logger.info(f"Worker: Starting batch for run {run_id} ({len(contacts)} contacts) at offset {offset}")
         success_batch, failed_batch, skipped_batch = 0, 0, 0
+        actually_processed = 0  # BE-FIX BE-7: Count only sent+failed (not skipped)
         total_batch_cost_inr = 0.0
         
         for i, contact in enumerate(contacts):
@@ -182,23 +204,30 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     failed_batch += 1
                     continue
 
+                # BE-FIX BE-10: Mid-batch pause check (every 50 contacts to balance responsiveness vs overhead)
+                if i > 0 and i % 50 == 0:
+                    db.refresh(run)
+                    if run.status == "paused":
+                        logger.info(f"Worker: Mid-batch pause detected at contact #{i} of batch. Stopping early.")
+                        break
+
                 # 1. Idempotency Protection (Rule: Never dual-send)
                 if is_message_already_sent(db, campaign_id, phone):
-                    logger.info(f"Worker: Skipping contact {phone}. Message already exists in DB for this campaign.")
+                    logger.info(f"Worker: Skipping {phone} — already sent for this campaign.")
                     skipped_batch += 1
-                    continue
+                    continue  # BE-FIX BE-7: skipped = NOT counted in processed
 
                 # 2. Check for Opt-Out (STOP keyword)
                 if is_contact_blocked(db, phone):
                     logger.info(f"Worker: Skipping blocked contact {phone}")
                     skipped_batch += 1
-                    continue
+                    continue  # BE-FIX BE-7: skipped = NOT counted in processed
                 
                 # Determine Message Category
                 cat = template.category.lower() if template else "marketing"
                 
-                # Billing & Conversation Tracking
-                billing_res = ensure_conversation(db, contact.phone_number, cat)
+                # Billing Tracking (Deferred commit - Rule: Only charge if send succeeds)
+                billing_res = ensure_conversation(db, contact.phone_number, cat, commit=False)
                 msg_cost_inr = billing_res.get("cost_inr", 0.0)
                 
                 # Anti-Spam Human-like delay (Rule 7)
@@ -213,10 +242,12 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     if header_comp:
                         media_format = header_comp.get("format", "").lower()
                         if media_format in ["image", "video", "document"]:
-                            # Robust Media Detection (Rule: Differentiate Link vs Meta Handle)
+                            # Robust Media Detection (Rule: Differentiate Link vs Meta ID/Handle)
                             media_payload = {}
-                            # Handles usually start with 'h/' or are numeric IDs
-                            is_handle = campaign.media_url.startswith("h/") or campaign.media_url.isdigit()
+                            
+                            # Meta handles can be numeric or alphanumeric (e.g., '1:abc...', '4:xyz...', or 'h/...')
+                            # If it's NOT a URL, we treat it as an ID/Handle.
+                            is_handle = not str(campaign.media_url).lstrip().lower().startswith(("http://", "https://"))
                             
                             if is_handle:
                                 media_payload = {"id": campaign.media_url}
@@ -235,33 +266,44 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                             logger.info(f"Worker: Injected {media_format} header ({'ID' if is_handle else 'Link'}) for {contact.phone_number}. Payload: {json.dumps(media_payload)}")
 
                 # Handle Body Parameters (Variables mapping)
+                # BE-FIX: Detect actual variable count needed by template (Rule: Prevent #132000 mismatch)
+                body_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "BODY"), None)
+                required_var_count = 0
+                if body_comp and "text" in body_comp:
+                    required_var_count = len(re.findall(r"\{\{\d+\}\}", body_comp["text"]))
+
+                body_parameters = []
                 if campaign.template_params:
                     # Sequentiality Check: Meta requires variables in order {{1}}, {{2}}, ...
-                    # We sort keys numerically: "1", "2", "3"
                     param_keys = sorted(campaign.template_params.keys(), key=lambda x: int(x) if x.isdigit() else 999)
-                    body_parameters = []
                     
                     for pk in param_keys:
                         mapping = campaign.template_params[pk]
                         val = ""
                         
                         if isinstance(mapping, str) and mapping.startswith("contact."):
-                            # Resolve from contact model
                             field_name = mapping.split(".")[1]
-                            # Handle common aliases (e.g. name, company_name)
+                            if field_name == "category" and not hasattr(contact, "category"):
+                                field_name = "customer_category"
                             val = getattr(contact, field_name, "")
                         else:
-                            # Static text for all contacts in this campaign
                             val = mapping
                             
                         body_parameters.append({"type": "text", "text": str(val) if val is not None else ""})
-                    
-                    if body_parameters:
-                        message_components.append({
-                            "type": "body",
-                            "parameters": body_parameters
-                        })
-                        logger.debug(f"Worker: Resolved {len(body_parameters)} body params for {contact.phone_number}")
+                
+                # BE-FIX: Filling gaps if campaign params < required template vars
+                # This ensures we always send the correct NUMBER of params, even if mappings are missing.
+                while len(body_parameters) < required_var_count:
+                    missing_idx = len(body_parameters) + 1
+                    logger.warning(f"Worker: Param mismatch for {phone}. Missing variable {{{{{missing_idx}}}}}. Injecting fallback.")
+                    body_parameters.append({"type": "text", "text": " "}) 
+                
+                if body_parameters:
+                    message_components.append({
+                        "type": "body",
+                        "parameters": body_parameters
+                    })
+                    logger.debug(f"Worker: Resolved {len(body_parameters)} body params for {contact.phone_number}")
 
                 # Send Message
                 response = send_template_message(
@@ -271,35 +313,69 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     language=template_language
                 )
                 
+                # Defensive check: ensure response is a dict (not str) before calling .get()
+                if not isinstance(response, dict):
+                    logger.error(f"Worker: Unexpected response type {type(response)} for {phone}: {response}")
+                    response = {"error": str(response), "code": None}
+
                 if "error" in response:
-                    logger.error(f"Worker: Send FAILED for {contact.phone_number}: {response.get('error')}")
+                    error_msg = response.get("error")
                     code = response.get("code")
+                    logger.error(f"Worker: Send FAILED for {phone}: {error_msg} (Code: {code})")
+                    
+                    # Store a human-readable but detailed error reason
+                    status_error = f"({code}) {error_msg}" if code else error_msg
                     
                     # Handle Rate & Account Limits
                     if code in [429, 131045, 131048]:
-                        jitter = random.uniform(10, 60)
-                        wait_time = (120 * (2 ** self.request.retries)) + jitter
-                        raise self.retry(exc=Exception(f"Meta Capacity Limit {code}"), countdown=wait_time)
+                        # Rate limit exponential backoff: 2, 4, 8 mins
+                        wait_time = (120 * (2 ** self.request.retries)) + random.uniform(5, 15)
+                        raise self.retry(exc=Exception(f"Meta Rate Limit {code}"), countdown=wait_time)
 
                     # Save failed log
+                    # Format: ERR_<CODE>_<PHONE>_<CAMPAIGN_SHORT>_<TS>
+                    unique_err_id = f"ERR_{code}_{phone}_{campaign_id[:5]}_{int(time.time())}"
+                    
+                    # If send failed, ROLLBACK the pending billing conversation to avoid leakage
+                    db.rollback() 
+                    
+                    # Re-add the failure log in a clean state
+                    # Capture the detailed Meta error if available
+                    meta_id = unique_err_id
+                    
+                    # Extract error details from the response (which is in 'res_data' or 'response')
+                    res_data = response if isinstance(response, dict) else {}
+                    raw_err = res_data.get("error", "Unknown Meta Error")
+                    
+                    # Store with code in parens for frontend mapping
+                    status_error = f"({code}) {raw_err}"
+
                     msg = WhatsAppMessage(
-                        wa_id=contact.phone_number, direction="out",
+                        wa_id=phone, direction="out",
                         delivery_status="failed", campaign_id=campaign_id,
                         message_type="template", template_name=campaign.template_name,
-                        meta_message_id=f"ERR_{code}_{contact.phone_number}",
-                        status_error=str(response.get("error"))
+                        meta_message_id=meta_id,
+                        status_error=status_error
                     )
                     db.add(msg)
+                    db.commit() # Save the failure record immediately
+                    
                     failed_batch += 1
+                    actually_processed += 1
                 else:
                     success_batch += 1
+                    actually_processed += 1  # BE-FIX BE-7
                     total_batch_cost_inr += msg_cost_inr
-                    meta_id = response.get("messages", [{}])[0].get("id")
-                    logger.debug(f"Worker: Message sent to {contact.phone_number} -> MetaID: {meta_id}")
+                    
+                    # Safe retrieval of messages list and meta ID
+                    msgs = response.get("messages", [])
+                    meta_id = msgs[0].get("id") if (isinstance(msgs, list) and len(msgs) > 0 and isinstance(msgs[0], dict)) else f"SUCCESS_{phone}"
+                    
+                    logger.debug(f"Worker: Message sent to {phone} -> MetaID: {meta_id}")
                     
                     # Save outgoing log
                     msg = WhatsAppMessage(
-                        wa_id=contact.phone_number, direction="out",
+                        wa_id=phone, direction="out",
                         meta_message_id=meta_id, campaign_id=campaign_id,
                         message_type="template", template_name=campaign.template_name,
                         whatsapp_cost=msg_cost_inr,
@@ -307,28 +383,29 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     )
                     db.add(msg)
             except Exception as item_err:
-                logger.error(f"Worker: CRITICAL ERROR processing contact {contact.phone_number}: {str(item_err)}")
+                error_str = str(item_err)
+                logger.error(f"Worker: ERROR processing contact {contact.phone_number}: {error_str}")
+                
+                # Check for 'Connection aborted' (10053) specifically
+                if "Connection aborted" in error_str or "10053" in error_str:
+                    logger.warning("Worker: Network connection was aborted by host. Retrying batch...")
+                    # Immediate retry with small jitter to re-establish connection
+                    raise self.retry(exc=item_err, countdown=random.uniform(1, 3))
+
                 failed_batch += 1
+                actually_processed += 1  # BE-FIX BE-7: count failed as processed (not skipped)
         
-        # Update Run Stats
-        run.processed_count += len(contacts)
+        # BE-FIX BE-7: Update Run Stats — only count actually_processed (sent+failed), NOT skipped
+        run.processed_count += actually_processed
         run.success_count += success_batch
         run.failed_count += failed_batch
         run.total_cost_inr += total_batch_cost_inr
-        run.last_processed_offset = offset + len(contacts)
+        run.last_processed_offset = offset + len(contacts)  # Offset always advances by full batch length
+        logger.info(f"Worker: Batch stats — sent={success_batch}, failed={failed_batch}, skipped={skipped_batch}, processed={actually_processed}")
         
         # Update Campaign Stats
         campaign.total_cost_inr += total_batch_cost_inr
         db.commit()
-
-        # Quality Risk check (Rule 10)
-        risk_percentage = check_quality_risk(db)
-        if risk_percentage > 20.0:
-            run.status = "paused"
-            run.failure_reason = f"High failure rate ({risk_percentage}%). Paused for safety."
-            campaign.status = "paused"
-            db.commit()
-            return f"PAUSED: Quality Risk {risk_percentage}%"
 
         # 4. Notify UI of progress via Redis Pub/Sub
         manager.publish_event("campaign_progress", {
@@ -341,16 +418,39 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
             "status": run.status
         })
 
-        # Check if more contacts remain
-        if run.processed_count < run.total_contacts:
-            # Use last_processed_offset to ensure proper resume after failures
+        # Check if more contacts remain (compare offset-based, not processed_count-based)
+        if run.last_processed_offset < run.total_contacts:
+            # BE-FIX: Quality Risk check (Rule 10)
+            # ONLY pause if we actually have more messages left to send.
+            # If the campaign is done, marking it as paused is redundant and logically wrong.
+            risk_percentage = check_quality_risk(db)
+            if risk_percentage > 20.0:
+                run.status = "paused"
+                run.failure_reason = f"High failure rate ({risk_percentage}%). Paused for safety."
+                campaign.status = "paused"
+                db.commit()
+                
+                # Notify UI of the pause
+                manager.publish_event("campaign_progress", {
+                    "campaign_id": campaign_id,
+                    "run_id": run_id,
+                    "processed": run.processed_count,
+                    "total": run.total_contacts,
+                    "success": run.success_count,
+                    "failed": run.failed_count,
+                    "status": "paused"
+                })
+                return f"PAUSED: Quality Risk {risk_percentage}%"
+
             next_offset = run.last_processed_offset
-            logger.info(f"Worker: Batch done. Progress: {run.processed_count}/{run.total_contacts}. Queuing next batch at {next_offset}")
+            logger.info(f"Worker: Queuing next batch at offset {next_offset} (total={run.total_contacts})")
             send_campaign_batch.delay(run_id, campaign_id, next_offset, limit)
         else:
-            logger.info(f"Worker: Campaign run {run_id} COMPLETED SUCCESSFULLLY.")
+            logger.info(f"Worker: Campaign run {run_id} COMPLETED SUCCESSFULLY.")
             run.status = "completed"
+            run.completed_at = datetime.now(timezone.utc)    # BE-FIX BE-12: was never set
             campaign.status = "completed"
+            campaign.completed_at = datetime.now(timezone.utc)  # BE-FIX BE-12: was never set
             db.commit()
             
             # Final Completion notification
@@ -378,25 +478,17 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
         return "Max retries exceeded. Campaign Put ON HOLD."
     except Exception as exc:
         db.rollback()
-        # CRITICAL: Record the exact error in the DB so it is visible in the UI
-        error_msg = f"Worker Exception: {str(exc)}"
-        logger.error(error_msg)
+        # Calculate next retry delay: 4, 8, 16 minutes
+        retry_intervals = [240, 480, 960]
+        curr_retry = self.request.retries
+        wait_time = retry_intervals[curr_retry] if curr_retry < len(retry_intervals) else 960
         
-        try:
-            # Re-fetch records to avoid 'DetachedInstance' or 'stale' states after rollback
-            run = db.query(CampaignRun).get(run_id)
-            campaign = db.query(Campaign).get(campaign_id)
-            if run:
-                run.status = "failed"
-                run.failure_reason = error_msg
-            if campaign:
-                campaign.status = "failed"
-                campaign.failure_reason = error_msg
-            db.commit()
-            logger.info("Worker: Successfully recorded failure in database.")
-        except Exception as db_err:
-            logger.error(f"Worker: Failed to record failure in DB: {str(db_err)}")
-
-        raise self.retry(exc=exc, countdown=60)
+        error_msg = f"Worker Retry #{curr_retry + 1} in {wait_time//60}m: {str(exc)}"
+        logger.warning(error_msg)
+        
+        # Maintain 'running' status while retrying to avoid user confusion
+        # We only set to 'failed' in the MaxRetriesExceededError block below.
+        
+        raise self.retry(exc=exc, countdown=wait_time)
     finally:
         db.close()

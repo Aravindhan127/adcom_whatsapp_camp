@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Text, DateTime, Integer, Float, ForeignKey, JSON
+from sqlalchemy import Column, String, Text, DateTime, Integer, Float, ForeignKey, JSON, Boolean
 
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -12,6 +12,7 @@ class Campaign(Base):
     name = Column(String(255), nullable=False)
     template_name = Column(String(255), nullable=False) # Maps to Meta Template Name
     status = Column(String(20), default="draft") # 'draft', 'scheduled', 'running', 'completed', 'failed'
+    is_deleted = Column(Boolean, default=False)
     media_url = Column(Text, nullable=True) # Public URL for Image/Video/Doc header
     template_params = Column(JSON, nullable=True) # Mapping of variable ID to contact field or static text
 

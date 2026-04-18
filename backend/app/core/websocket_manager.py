@@ -13,7 +13,7 @@ class ConnectionManager:
     def __init__(self):
         # Active connections: [WebSocket, ...]
         self.active_connections: List[WebSocket] = []
-        self.redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.redis_url = os.getenv("REDIS_URL")
         self._redis_client = None
 
     @property

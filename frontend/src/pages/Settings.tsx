@@ -10,12 +10,20 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { whatsappApi } from '../services/whatsappApi';
+import { useToast } from '../components/Toast';
 import PageHeader from '../components/PageHeader';
 
 const Settings: React.FC = () => {
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
-    const [settings, setSettings] = useState({
+    const [settings, setSettings] = useState<{
+        meta_balance_inr: number | string;
+        meta_balance_usd: number | string;
+        marketing_rate_inr: number;
+        utility_rate_inr: number;
+        authentication_rate_inr: number;
+        exchange_rate: number;
+    }>({
         meta_balance_inr: 0,
         meta_balance_usd: 0,
         marketing_rate_inr: 0.82,
@@ -27,12 +35,22 @@ const Settings: React.FC = () => {
     const fetchSettings = async () => {
         setLoading(true);
         try {
-            const stats = await whatsappApi.getStats();
-            setSettings(prev => ({
-                ...prev,
-                meta_balance_inr: stats.balance.estimated_inr,
-                meta_balance_usd: stats.balance.estimated_usd,
-            }));
+            const [stats, rateData] = await Promise.all([
+                whatsappApi.getStats(),
+                whatsappApi.getExchangeRate().catch(() => ({ exchange_rate: 84.0 }))
+            ]);
+            
+            setSettings(prev => {
+                const inr = stats.balance.estimated_inr || 0;
+                const rate = rateData.exchange_rate || prev.exchange_rate || 84.0;
+                
+                return {
+                    ...prev,
+                    exchange_rate: rate,
+                    meta_balance_inr: inr ? Number(inr).toFixed(2) : '0.00',
+                    meta_balance_usd: (inr / rate).toFixed(2),
+                };
+            });
         } catch (error) {
             console.error('Error fetching settings:', error);
         } finally {
@@ -44,14 +62,16 @@ const Settings: React.FC = () => {
         fetchSettings();
     }, []);
 
+    const { success, error: toastError } = useToast();
+
     const handleSave = async (e: React.FormEvent) => {
         e.preventDefault();
         setSaving(true);
         try {
             await new Promise(resolve => setTimeout(resolve, 800));
-            alert('Settings updated successfully');
+            success('Settings saved', 'Your preferences have been updated.');
         } catch (error) {
-            alert('Failed to update settings');
+            toastError('Save failed', 'Could not update settings. Please try again.');
         } finally {
             setSaving(false);
         }
@@ -91,8 +111,13 @@ const Settings: React.FC = () => {
                                     <span className="absolute left-4 top-1/2 -translate-y-1/2 font-bold text-slate-400 text-lg">₹</span>
                                     <input 
                                         type="number"
+                                        step="0.01"
                                         value={settings.meta_balance_inr}
-                                        onChange={(e) => setSettings({...settings, meta_balance_inr: parseFloat(e.target.value)})}
+                                        onChange={(e) => {
+                                            const rawVal = e.target.value;
+                                            const num = parseFloat(rawVal) || 0;
+                                            setSettings({...settings, meta_balance_inr: rawVal as any, meta_balance_usd: (num / (settings.exchange_rate || 84.0)).toFixed(2) as any});
+                                        }}
                                         className="w-full pl-10 pr-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xl font-bold text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500/20 tabular-nums transition-all"
                                     />
                                 </div>
@@ -104,11 +129,12 @@ const Settings: React.FC = () => {
                                     <span className="absolute left-4 top-1/2 -translate-y-1/2 font-bold text-slate-400 text-lg">$</span>
                                     <input 
                                         type="number"
+                                        readOnly
                                         value={settings.meta_balance_usd}
-                                        onChange={(e) => setSettings({...settings, meta_balance_usd: parseFloat(e.target.value)})}
-                                        className="w-full pl-10 pr-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xl font-bold text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500/20 tabular-nums transition-all"
+                                        className="w-full pl-10 pr-4 py-3 bg-slate-100 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/50 rounded-lg text-xl font-bold text-slate-500 dark:text-slate-400 outline-none tabular-nums transition-all cursor-not-allowed select-none"
                                     />
                                 </div>
+                                <p className="text-[10px] text-slate-400 font-medium pl-1 italic">Read-only (calculated at ₹{settings.exchange_rate || 84.0} per $)</p>
                             </div>
                         </div>
                     </section>

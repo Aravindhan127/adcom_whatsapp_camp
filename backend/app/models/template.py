@@ -9,7 +9,7 @@ class WhatsAppTemplate(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), unique=True, index=True, nullable=False)
     category = Column(String(50), nullable=False) # 'MARKETING', 'UTILITY', 'AUTHENTICATION'
-    language = Column(String(10), default="en")
+    language = Column(String(10), default="en_US")
     status = Column(String(20), default="PENDING") # 'APPROVED', 'REJECTED', 'PENDING', 'PAUSED'
     meta_template_id = Column(String(100), unique=True, index=True, nullable=True) # ID from Meta
     rejection_reason = Column(Text, nullable=True) # Reason why Meta rejected it

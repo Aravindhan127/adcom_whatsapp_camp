@@ -7,18 +7,22 @@ import app.models  # Ensure all models (including Agent) are registered for FK l
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.settings import SystemSettings
 
-def ensure_conversation(db: Session, wa_id: str, category: str, meta_message_id: str = None) -> Dict[str, Any]:
+def ensure_conversation(db: Session, wa_id: str, category: str, meta_message_id: str = None, commit: bool = True, started_at: datetime = None) -> Dict[str, Any]:
     """
     Ensures a 24-hour conversation window per category as per Meta rules.
     Also deducts the cost from the system balance if it's a new conversation.
+    Set commit=False if you want to verify sending before charging the user.
     """
     print(f"Billing: Ensuring conversation for {wa_id} [{category}]")
     twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
     
+    import re
+    wa_id_clean = re.sub(r"\D", "", wa_id)
+    
     try:
         # Check if we already have an active conversation window for this category
         active = db.query(WhatsAppConversation).filter(
-            WhatsAppConversation.wa_id == wa_id,
+            WhatsAppConversation.wa_id.ilike(f"%{wa_id_clean}%"),
             WhatsAppConversation.category == category,
             WhatsAppConversation.started_at >= twenty_four_hours_ago
         ).order_by(WhatsAppConversation.started_at.desc()).first()
@@ -66,29 +70,35 @@ def ensure_conversation(db: Session, wa_id: str, category: str, meta_message_id:
     
     # Create the conversation
     try:
+        if not started_at:
+            started_at = datetime.now(timezone.utc)
+        
         new_conv = WhatsAppConversation(
-            wa_id=wa_id,
+            wa_id=wa_id_clean, # Standardized number
             category=category,
             cost_usd=cost_usd,
             cost_inr=cost_inr,
             rate_inr=cost_inr,
             exchange_rate=exchange_rate,
-            started_at=datetime.now(timezone.utc),
+            started_at=started_at,
+            window_expires_at=started_at + timedelta(hours=24), # Set the 24h window
             billing_status="charged",
             meta_message_id=meta_message_id
         )
         
         # Deduct from System Balance (Rule 3)
         if cost_inr > 0:
-            settings.meta_balance_inr = (settings.meta_balance_inr or 0) - cost_inr
-            settings.meta_balance_usd = (settings.meta_balance_usd or 0) - cost_usd
+            settings.meta_balance_inr = round((settings.meta_balance_inr or 0) - cost_inr, 4)
+            settings.meta_balance_usd = round((settings.meta_balance_usd or 0) - cost_usd, 4)
         
         db.add(new_conv)
-        db.commit()
-        db.refresh(new_conv)
+        if commit:
+            db.commit()
+            db.refresh(new_conv)
         
         return {"conversation": new_conv, "is_new": True, "cost_inr": cost_inr, "cost_usd": cost_usd}
     except Exception as e:
         logger.error(f"Billing: Error saving new conversation: {str(e)}")
-        db.rollback()
+        if commit:
+            db.rollback()
         raise

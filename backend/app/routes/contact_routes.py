@@ -3,7 +3,7 @@ import io
 import json
 import uuid
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
 from pydantic import BaseModel
@@ -13,6 +13,8 @@ from app.core.database import get_db
 from app.models.contact import Contact, ContactList, ImportHistory, ContactStatus, ContactSource, ImportStatus
 from app.core.security import get_current_user, RoleChecker
 from app.models.agent import Agent
+from app.services.audit_service import log_action
+from fastapi import Request
 
 # Access control workers
 admin_only = RoleChecker(["admin"])
@@ -41,6 +43,22 @@ def parse_date(date_str: Optional[str]) -> Optional[datetime]:
     
     # If all formats fail, return None instead of crashing
     return None
+
+def sanitize_excel_phone(val):
+    """Converts numeric/scientific notation values from Excel/CSV to clean strings."""
+    if val is None: return ""
+    # Handle direct numeric types (float/int)
+    if isinstance(val, (int, float)):
+        return "{:.0f}".format(val)
+    
+    # Handle string scientific notation (e.g. '9.19E+11')
+    s_val = str(val).strip()
+    if 'E+' in s_val.upper():
+        try:
+            return "{:.0f}".format(float(s_val))
+        except:
+            pass
+    return s_val
 
 router = APIRouter(prefix="/contacts", tags=["Contacts Management"])
 
@@ -88,6 +106,7 @@ def normalize_phone(phone: str) -> str:
 
 @router.post("/bulk-import", summary="Bulk Import Contacts")
 async def bulk_import_contacts(
+    request: Request,
     file: UploadFile = File(...),
     uploaded_by: Optional[str] = Form(None),
     list_id: Optional[uuid.UUID] = Form(None),
@@ -97,14 +116,18 @@ async def bulk_import_contacts(
     current_user: Agent = Depends(any_agent)
 ):
     filename = file.filename.lower()
-    if not (filename.endswith('.csv') or filename.endswith('.xlsx')):
-        raise HTTPException(400, "Only CSV and Excel (.xlsx) supported")
+    if not (filename.endswith('.csv') or filename.endswith('.xlsx') or filename.endswith('.xls') or filename.endswith('.xlx')):
+        raise HTTPException(400, "Only CSV and Excel (.xlsx, .xls, .xlx) supported")
     
     file_type = 'csv' if filename.endswith('.csv') else 'xlsx'
+    if filename.endswith('.xls'):
+        file_type = 'xls'
+    elif filename.endswith('.xlx'):
+        file_type = 'xlx'
     
     import_record = ImportHistory(
         filename=file.filename, file_type=file_type,
-        uploaded_by=uploaded_by or "system", status=ImportStatus.PROCESSING.value
+        uploaded_by=current_user.username, status=ImportStatus.PROCESSING.value
     )
     db.add(import_record)
     db.commit()
@@ -116,6 +139,15 @@ async def bulk_import_contacts(
         if file_type == 'csv':
             decoded = content.decode('utf-8', errors='ignore')
             rows = list(csv.DictReader(io.StringIO(decoded)))
+        elif file_type == 'xls':
+            try:
+                import xlrd
+            except ImportError:
+                raise HTTPException(status_code=500, detail="xlrd library is required to parse .xls files. Please install it (e.g., run 'pip install xlrd').")
+            wb = xlrd.open_workbook(file_contents=content)
+            sheet = wb.sheet_by_index(0)
+            headers = [str(x).lower().strip() for x in sheet.row_values(0)]
+            rows = [dict(zip(headers, sheet.row_values(rx))) for rx in range(1, sheet.nrows) if any(sheet.row_values(rx))]
         else:
             import openpyxl
             wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
@@ -141,6 +173,7 @@ async def bulk_import_contacts(
             # Use mapping or fallback to common names
             phone_col = mapping.get('phone_number')
             phone = row.get(phone_col) if phone_col else (row.get('phone_number') or row.get('phone') or row.get('mobile'))
+            phone = sanitize_excel_phone(phone)
             
             if phone:
                 is_valid, cleaned, _, _ = validate_phone_number(phone)
@@ -158,7 +191,9 @@ async def bulk_import_contacts(
             ).all()
             existing_in_db_map = {normalize_phone(c.phone_number): c for c in existing_contacts}
 
-        success, duplicate, invalid, updated = 0, 0, 0, 0
+        success, updated = 0, 0
+        duplicate_details = [] # List of {"phone": str, "name": str}
+        invalid_details = []
         contacts_to_create = []
         seen_in_batch = set()
         
@@ -168,19 +203,23 @@ async def bulk_import_contacts(
             name_col = mapping.get('name')
             
             phone = row.get(phone_col) if phone_col else (row.get('phone_number') or row.get('phone') or row.get('mobile'))
+            phone = sanitize_excel_phone(phone)
             name = row.get(name_col) if name_col else (row.get('name') or row.get('full_name'))
             
             if not phone:
-                invalid += 1; continue
+                invalid_details.append({"row": rows.index(row) + 2, "error": "Missing phone number"})
+                continue
             
             is_valid, cleaned, cc, err = validate_phone_number(phone)
             if not is_valid:
-                invalid += 1; continue
+                invalid_details.append({"phone": str(phone), "error": err or "Invalid format"})
+                continue
                 
             norm = normalize_phone(cleaned)
             
             if norm in seen_in_batch:
-                duplicate += 1; continue
+                duplicate_details.append({"phone": cleaned, "name": name})
+                continue
             seen_in_batch.add(norm)
 
             if norm in existing_in_db_map:
@@ -210,7 +249,7 @@ async def bulk_import_contacts(
                     
                     updated += 1
                 else:
-                    duplicate += 1
+                    duplicate_details.append({"phone": cleaned, "name": name})
                 continue
             
             # Utility to get value from row based on mapping or fallbacks
@@ -245,20 +284,41 @@ async def bulk_import_contacts(
         
         db.commit()
         
+        # Summary for DB
+        summary = {
+            "success": success,
+            "updated": updated,
+            "duplicates": len(duplicate_details),
+            "invalid": len(invalid_details),
+            "duplicate_list": duplicate_details[:100], # Cap for DB storage
+            "invalid_list": invalid_details[:100]
+        }
+        
         import_record.success_count = success
-        import_record.duplicate_count = duplicate
-        import_record.failed_count = invalid
+        import_record.duplicate_count = len(duplicate_details)
+        import_record.failed_count = len(invalid_details)
+        import_record.error_details = json.dumps(summary)
         import_record.status = ImportStatus.COMPLETED.value
-        import_record.completed_at = datetime.utcnow()
+        import_record.completed_at = datetime.now(timezone.utc)
         db.commit()
         
+        log_action(
+            db, "BULK_IMPORT", "CONTACTS", 
+            user_id=str(current_user.id), username=current_user.username,
+            details={"filename": file.filename, "success": success, "updated": updated, "total": len(rows)},
+            request=request
+        )
+
         return {
             "message": "Import completed", 
             "import_id": str(import_record.id), 
             "success": success, 
-            "duplicates": duplicate, 
+            "duplicates": len(duplicate_details), 
+            "duplicate_list": duplicate_details,
             "updated": updated,
-            "invalid": invalid
+            "invalid": len(invalid_details),
+            "invalid_list": invalid_details,
+            "uploaded_by": current_user.username
         }
     except Exception as e:
         db.rollback()
@@ -286,6 +346,7 @@ class ContactCreate(BaseModel):
 @router.post("/", summary="Create Single Contact")
 async def create_contact(
     contact: ContactCreate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -323,7 +384,7 @@ async def create_contact(
             db.refresh(existing)
             return existing
         else:
-            raise HTTPException(400, "Contact with this phone number already exists")
+            raise HTTPException(400, f"This number ({cleaned}) already exists. Do you want to update? If yes, choose to update. If not, do not update.")
     
     new_contact = Contact(
         phone_number=cleaned,
@@ -344,7 +405,33 @@ async def create_contact(
     db.add(new_contact)
     db.commit()
     db.refresh(new_contact)
+
+    log_action(
+        db, "CREATE_CONTACT", "CONTACTS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"phone": cleaned, "name": contact.name},
+        request=request
+    )
+
     return new_contact
+
+@router.get("/filter-options", summary="Get Unique Values for Contact Filters")
+async def get_contact_filter_options(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(any_agent)
+):
+    """Returns unique values for categories, stages, cities, and sources to populate UI filters."""
+    categories = db.query(Contact.customer_category).filter(Contact.customer_category != None).distinct().all()
+    stages = db.query(Contact.customer_stage).filter(Contact.customer_stage != None).distinct().all()
+    cities = db.query(Contact.city).filter(Contact.city != None).distinct().all()
+    sources = db.query(Contact.lead_source).filter(Contact.lead_source != None).distinct().all()
+
+    return {
+        "categories": [c[0] for c in categories],
+        "stages": [s[0] for s in stages],
+        "cities": [ct[0] for ct in cities],
+        "sources": [src[0] for src in sources]
+    }
 
 @router.get("/", summary="List Contacts with Filters")
 async def list_contacts(
@@ -353,6 +440,13 @@ async def list_contacts(
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     list_id: Optional[uuid.UUID] = Query(None),
+    company_name: Optional[str] = Query(None),
+    lead_source: Optional[str] = Query(None),
+    customer_category: Optional[str] = Query(None),
+    customer_stage: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -373,12 +467,46 @@ async def list_contacts(
             query = query.filter(Contact.status == status)
         if list_id:
             query = query.filter(Contact.list_id == list_id)
+        if company_name:
+            query = query.filter(Contact.company_name.ilike(f"%{company_name}%"))
+        if lead_source:
+            query = query.filter(Contact.lead_source.ilike(f"%{lead_source}%"))
+        if customer_category:
+            query = query.filter(Contact.customer_category == customer_category)
+        if customer_stage:
+            query = query.filter(Contact.customer_stage == customer_stage)
+        if city:
+            query = query.filter(Contact.city.ilike(f"%{city}%"))
         
         # 3. Total Count (before pagination)
         total = query.count()
         
-        # 4. Paginate
-        items = query.order_by(Contact.created_at.desc()).offset(offset).limit(limit).all()
+        # 4. Sorting
+        valid_columns = {
+            "name": Contact.name,
+            "phone_number": Contact.phone_number,
+            "created_at": Contact.created_at,
+            "company_name": Contact.company_name,
+            "city": Contact.city,
+            "customer_category": Contact.customer_category,
+            "customer_stage": Contact.customer_stage,
+            "lead_source": Contact.lead_source,
+            "date_of_birth": Contact.date_of_birth,
+            "product_service_interest": Contact.product_service_interest,
+            "consent_confirmation": Contact.consent_confirmation
+        }
+        
+        # Safe column resolution
+        target_col_name = sort_by if sort_by in valid_columns else "created_at"
+        sort_col = valid_columns[target_col_name]
+        
+        if sort_order.lower() == "asc":
+            query = query.order_by(sort_col.asc())
+        else:
+            query = query.order_by(sort_col.desc())
+            
+        # 5. Paginate
+        items = query.offset(offset).limit(limit).all()
         
         return {
             "total": total,
@@ -396,28 +524,37 @@ class BulkActionRequest(BaseModel):
 
 @router.post("/bulk-action", summary="Handle Bulk Contact Actions")
 async def bulk_contact_action(
-    request: BulkActionRequest,
+    request_payload: BulkActionRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(admin_only)
 ):
     query = db.query(Contact).filter(Contact.id.in_(request.contact_ids))
     
-    if request.action == "delete":
+    if request_payload.action == "delete":
         count = query.delete(synchronize_session=False)
         db.commit()
+
+        log_action(
+            db, "BULK_DELETE_CONTACTS", "CONTACTS", 
+            user_id=str(current_user.id), username=current_user.username,
+            details={"count": count},
+            request=request
+        )
+
         return {"message": f"Successfully deleted {count} contacts"}
     
-    elif request.action == "update_status":
-        if not request.value:
+    elif request_payload.action == "update_status":
+        if not request_payload.value:
             raise HTTPException(status_code=400, detail="Status value required")
-        count = query.update({"status": request.value}, synchronize_session=False)
+        count = query.update({"status": request_payload.value}, synchronize_session=False)
         db.commit()
         return {"message": f"Successfully updated status for {count} contacts"}
     
-    elif request.action == "update_customer_category":
-        if not request.value:
+    elif request_payload.action == "update_customer_category":
+        if not request_payload.value:
             raise HTTPException(status_code=400, detail="Category value required")
-        count = query.update({"customer_category": request.value}, synchronize_session=False)
+        count = query.update({"customer_category": request_payload.value}, synchronize_session=False)
         db.commit()
         return {"message": f"Successfully updated customer category for {count} contacts"}
     
@@ -520,6 +657,7 @@ def get_contact(
 async def update_contact(
     contact_id: uuid.UUID,
     contact_in: ContactUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -563,11 +701,20 @@ async def update_contact(
 
     db.commit()
     db.refresh(contact)
+
+    log_action(
+        db, "UPDATE_CONTACT", "CONTACTS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"phone": contact.phone_number, "name": contact.name},
+        request=request
+    )
+
     return contact
 
 @router.delete("/{contact_id}", summary="Delete a Single Contact")
 async def delete_contact(
     contact_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(admin_only)
 ):
@@ -575,6 +722,13 @@ async def delete_contact(
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     
+    log_action(
+        db, "DELETE_CONTACT", "CONTACTS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"phone": contact.phone_number, "name": contact.name},
+        request=request
+    )
+
     db.delete(contact)
     db.commit()
     return {"message": "Contact deleted successfully"}

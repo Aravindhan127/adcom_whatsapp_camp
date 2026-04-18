@@ -7,6 +7,7 @@ from app.models.settings import SystemSettings
 from app.models.template import WhatsAppTemplate
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
+from app.models.audit_log import AuditLog
 
 __all__ = [
     "Base",
@@ -19,4 +20,5 @@ __all__ = [
     "WhatsAppTemplate",
     "WhatsAppMessage",
     "WhatsAppConversation",
+    "AuditLog",
 ]

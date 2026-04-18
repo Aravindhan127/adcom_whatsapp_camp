@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Upload, X, Check, ArrowRight, Table, AlertCircle, Loader2 } from 'lucide-react';
+import { CustomSelect } from '../CustomSelect';
 import { whatsappApi } from '../../services/whatsappApi';
 import * as XLSX from 'xlsx';
 
@@ -143,16 +144,16 @@ const BulkImportMapper: React.FC<Props> = ({ onClose, onSuccess }) => {
                     
                     <ArrowRight size={16} className="text-slate-300 hidden md:block" />
                     
-                    <select 
+                    <CustomSelect
                       value={mapping[field.key] || ''} 
-                      onChange={(e) => setMapping(prev => ({...prev, [field.key]: e.target.value}))}
-                      className="flex-1 bg-slate-50 dark:bg-slate-800 border-none rounded-lg py-2 px-3 text-sm font-medium outline-none focus:ring-2 focus:ring-indigo-500/20"
-                    >
-                      <option value="">Don't Import</option>
-                      {headers.map(h => (
-                        <option key={h} value={h}>{h}</option>
-                      ))}
-                    </select>
+                      onChange={(v) => setMapping(prev => ({...prev, [field.key]: v}))}
+                      className="flex-1"
+                      placeholder="Don't Import"
+                      options={[
+                        { value: "", label: "Don't Import" },
+                        ...headers.map(h => ({ value: h, label: h }))
+                      ]}
+                    />
                     
                     <div className="w-6 flex justify-center">
                       {mapping[field.key] ? <Check size={16} className="text-emerald-500" /> : field.required ? <AlertCircle size={16} className="text-rose-400" /> : null}

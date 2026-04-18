@@ -7,6 +7,7 @@ import { whatsappApi } from '../services/whatsappApi';
 const GlobalStatus: React.FC = () => {
   const location = useLocation();
   const [redisHealthy, setRedisHealthy] = useState<boolean | null>(null);
+  const [exchangeRate, setExchangeRate] = useState<number | null>(null);
   const [activeCampaigns, setActiveCampaigns] = useState<any[]>([]);
   const [visible, setVisible] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -14,12 +15,14 @@ const GlobalStatus: React.FC = () => {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [health, progress] = await Promise.all([
+        const [health, progress, rateData] = await Promise.all([
           whatsappApi.getHealthSummary(),
-          whatsappApi.getActiveProgress()
+          whatsappApi.getActiveProgress(),
+          whatsappApi.getExchangeRate()
         ]);
         setRedisHealthy(health.redis?.status === 'healthy');
         setActiveCampaigns(progress);
+        setExchangeRate(rateData.exchange_rate);
         setVisible(true);
       } catch (err) {
         setRedisHealthy(false);
@@ -27,7 +30,9 @@ const GlobalStatus: React.FC = () => {
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 2000);
+    // FE-FIX FE-4: Changed 2000ms → 10000ms. 2s polling = 30 req/min/user of DB queries.
+    // Campaign progress real-time updates come via WebSocket; polling is just a fallback.
+    const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -43,10 +48,14 @@ const GlobalStatus: React.FC = () => {
         {/* Redis Status Pill (Persists and can be dragged) */}
         <div className="bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border border-slate-200 dark:border-slate-800 px-3 py-1.5 rounded-full shadow-lg flex items-center gap-2 transition-all hover:scale-105 group cursor-move">
           <Move size={10} className="text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-          <div className={`w-2 h-2 rounded-full ${redisHealthy ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)] animate-pulse' : 'bg-rose-500 animate-bounce'}`} />
-          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-400">
-            Redis: {redisHealthy ? 'Online' : 'Offline'}
-          </span>
+          
+          <div className="flex items-center gap-2">
+             <div className={`w-2 h-2 rounded-full ${redisHealthy ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)] animate-pulse' : 'bg-rose-500 animate-bounce'}`} />
+             <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+               Redis: {redisHealthy ? 'Online' : 'Offline'}
+             </span>
+          </div>
+
           {activeCampaigns.length > 0 && (
             <button 
               onClick={() => setIsMinimized(!isMinimized)}

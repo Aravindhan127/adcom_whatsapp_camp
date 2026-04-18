@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, Depends, Query, HTTPException, status
+from fastapi import APIRouter, Request, Depends, Query, HTTPException, status, Response
 from fastapi.security import OAuth2PasswordBearer
 from typing import Optional
 from uuid import UUID
@@ -14,12 +14,13 @@ logger = logging.getLogger("adcom-api")
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.agent import Agent
-from app.core.security import get_current_user, RoleChecker
+from app.core.security import get_current_user, get_current_user_flexible, RoleChecker
 from app.services.whatsapp_chat_service import finalize_billing_on_delivery, send_whatsapp_message, verify_whatsapp_token
 from app.services.billing import ensure_conversation
 from app.services.ai_brain import chat_with_knowledge
 from app.services.brochure_service import handle_brochure_request
 from app.core.websocket_manager import manager
+from app.services.meta_api import get_meta_media_url, get_meta_media_content
 
 # Access control workers
 admin_only = RoleChecker(["admin"])
@@ -29,10 +30,12 @@ any_agent = get_current_user
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
 
 def normalize_wa_id(wa_id: str) -> str:
-    """Normalize phone number to always start with + for consistency."""
-    if wa_id and not wa_id.startswith('+'):
-        return f'+{wa_id}'
-    return wa_id
+    """Normalize phone number to digits only for consistency."""
+    if not wa_id:
+        return ""
+    # Remove any non-digit characters (like +, spaces, dashes)
+    import re
+    return re.sub(r"\D", "", wa_id)
 
 @router.get("/webhook")
 async def whatsapp_verify(
@@ -105,7 +108,13 @@ async def receive_whatsapp(request: Request, db: Session = Depends(get_db)):
     
     # 1. Start/Resume Billing Window (Rule 1)
     billing = ensure_conversation(db, wa_id, "service", meta_message_id=meta_message_id)
-    conversation_id = billing["conversation"].id if billing.get("conversation") else None
+    conv = billing.get("conversation")
+    conversation_id = conv.id if conv else None
+    
+    # Refresh the 24h window (Every user message starts a new 24h service window)
+    if conv:
+        conv.window_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        db.commit()
     
     # 2. Save incoming message (Rule 5)
     existing_msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.meta_message_id == meta_message_id).first()
@@ -121,12 +130,19 @@ async def receive_whatsapp(request: Request, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(incoming)
 
+    # Look up contact name strictly from the Contact Table
+    # Smart Match: Use last 10 digits to resolve country code mismatches
+    last_10 = wa_id[-10:] if len(wa_id) >= 10 else wa_id
+    contact = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}")).first()
+    contact_name = contact.name if (contact and contact.name) else None
+
     # 3. Notify real-time (Rule: Live Chat updates)
     await manager.notify_new_message(wa_id, {
         "id": str(incoming.id),
         "text": user_text,
         "timestamp": incoming.created_at.isoformat() if incoming.created_at else datetime.now().isoformat(),
-        "sender": "user"
+        "sender": "user",
+        "contactName": contact_name
     })
 
     # 3. Handle Automated Brochure Request (Latest featuredev branch logic)
@@ -147,14 +163,10 @@ def list_conversations(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    # Base subquery: Get the latest conversation ID for each NORMALIZED phone number
-    # This ensures "one number, one time" even if stored with/without + prefix
-    from sqlalchemy import case
-    # Normalize wa_id in the subquery grouping
-    normalized_wa_id = func.replace(WhatsAppConversation.wa_id, ' ', '')
-    # We group by the normalized form to collapse +91xxx and 91xxx as same
+    # Base subquery: Get the latest conversation ID for each UNIQUE phone number (last 10 digits)
+    # This is the most robust way to collapse +91, 91, and other variants.
     latest_conv_ids_subquery = db.query(func.max(WhatsAppConversation.id)).group_by(
-        func.ltrim(WhatsAppConversation.wa_id, '+')
+        func.right(WhatsAppConversation.wa_id, 10)
     )
     
     query = db.query(WhatsAppConversation).filter(WhatsAppConversation.id.in_(latest_conv_ids_subquery))
@@ -173,11 +185,18 @@ def list_conversations(
     total = query.count()
     items = query.order_by(WhatsAppConversation.started_at.desc()).offset(skip).limit(limit).all()
     
+    from app.models.contact import Contact
+
     enriched = []
     now = datetime.now(timezone.utc)
     for conv in items:
         last_msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.conversation_id == conv.id).order_by(WhatsAppMessage.created_at.desc()).first()
         
+        # Look up contact name
+        last_10 = conv.wa_id[-10:] if len(conv.wa_id) >= 10 else conv.wa_id
+        contact = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}")).first()
+        contact_name = contact.name if contact else None
+
         # Determine if the 24h window is still active
         is_active = False
         if conv.window_expires_at:
@@ -186,6 +205,7 @@ def list_conversations(
         enriched.append({
             "sessionId": str(conv.id),
             "phoneNumber": normalize_wa_id(conv.wa_id),
+            "contactName": contact_name,
             "lastMessage": last_msg.message if last_msg else "No messages",
             "timestamp": last_msg.created_at.isoformat() if last_msg else conv.started_at.isoformat(),
             "unreadCount": 0,
@@ -204,11 +224,10 @@ def get_conversation_messages(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    # Normalize wa_id and also search both +91xxx and 91xxx formats
-    wa_id_normalized = normalize_wa_id(wa_id)
-    wa_id_no_plus = wa_id_normalized.lstrip('+')
+    # Use last 10 digits suffix matching for history to be extra robust
+    last_10 = wa_id.replace('+', '').replace(' ', '')[-10:] if len(wa_id) >= 10 else wa_id
     messages = db.query(WhatsAppMessage).filter(
-        WhatsAppMessage.wa_id.in_([wa_id_normalized, wa_id_no_plus])
+        WhatsAppMessage.wa_id.ilike(f"%{last_10}")
     ).order_by(WhatsAppMessage.created_at.desc()).offset(skip).limit(limit).all()
     
     formatted = [{
@@ -259,6 +278,11 @@ async def send_media_route(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
+    # 0. Normalize phone number (Standardizing for Rule 1 & Rule 5 consistency)
+    to = normalize_wa_id(to)
+    if not to:
+         raise HTTPException(status_code=400, detail="Invalid phone number 'to'")
+
     # 1. Validate media type
     if media_type.lower() not in ALLOWED_MEDIA_TYPES:
         raise HTTPException(
@@ -303,7 +327,9 @@ async def send_media_route(
 
         # Check for Meta API errors
         if "error" in res:
-            raise HTTPException(status_code=400, detail=res.get("error", "Failed to send media message"))
+            error_detail = res.get("error", "Failed to send media message")
+            logger.error(f"Meta Media Send Error: To={to}, Type={media_type}, Error={error_detail}")
+            raise HTTPException(status_code=400, detail=error_detail)
 
         return res
     except HTTPException:
@@ -316,3 +342,25 @@ async def send_media_route(
         if file_path.exists():
             file_path.unlink(missing_ok=True)
 
+@router.get("/media/{media_id}")
+async def get_media_proxy(
+    media_id: str,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_user_flexible)
+):
+    """Proxy route to fetch media from Meta and serve it to the frontend."""
+    # 1. Get download URL from Meta
+    meta_data = get_meta_media_url(media_id)
+    download_url = meta_data.get("url")
+    
+    if not download_url:
+        logger.error(f"Failed to get Meta media URL: {meta_data}")
+        raise HTTPException(status_code=404, detail="Media not found on Meta")
+        
+    # 2. Get binary content
+    content, mime_type = get_meta_media_content(download_url)
+    
+    if not content:
+        raise HTTPException(status_code=404, detail="Failed to download media content")
+        
+    return Response(content=content, media_type=mime_type)

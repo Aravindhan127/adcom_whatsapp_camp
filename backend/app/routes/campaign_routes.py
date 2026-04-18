@@ -13,12 +13,14 @@ from app.models.campaign import Campaign
 from app.models.contact import ContactList
 from app.models.settings import SystemSettings
 from app.services.campaign_service import start_campaign_run, pause_campaign, resume_campaign
-from app.services.analytics_service import get_campaign_analytics
+from app.services.analytics_service import get_campaign_analytics, get_campaign_detailed_logs
 from app.services.meta_api import upload_media
 from app.core.security import get_current_user, RoleChecker
 from app.models.agent import Agent
 from app.models.contact import Contact, ContactList
 from app.models.template import WhatsAppTemplate
+from app.services.audit_service import log_action
+from fastapi import Request
 
 # Access control workers
 admin_only = RoleChecker(["admin"])
@@ -43,7 +45,14 @@ async def upload_campaign_media(
                 f.write(content)
             
             # Send file to Meta API
-            res = upload_media(temp_path, file.content_type)
+            # Sanitize content_type (e.g., 'video/mp4' -> 'video')
+            m_type = "image"
+            if file.content_type:
+                if "video" in file.content_type: m_type = "video"
+                elif "audio" in file.content_type: m_type = "audio"
+                elif "pdf" in file.content_type or "document" in file.content_type: m_type = "document"
+
+            res = upload_media(temp_path, m_type)
             if "error" in res:
                 raise HTTPException(status_code=400, detail=res["error"])
             
@@ -70,9 +79,29 @@ class CampaignCreate(BaseModel):
 
 
 
-@router.post("/", summary="Create a Campaign")
+class CampaignResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    template_name: str
+    status: str
+    total_contacts: int
+    sent_count: int
+    delivered_count: int
+    read_count: int
+    failed_count: int
+    on_hold_count: int = 0
+    failure_reason: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/", summary="Create a Campaign", response_model=CampaignResponse)
 def create_campaign(
     payload: CampaignCreate, 
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -115,6 +144,10 @@ def create_campaign(
             if not template_params and template.variable_mappings:
                 template_params = template.variable_mappings
 
+    total_contacts = db.query(Contact).filter(
+        Contact.list_id == final_list_id
+    ).count()
+
     new_campaign = Campaign(
         name=payload.name,
         template_name=payload.template_name,
@@ -123,10 +156,19 @@ def create_campaign(
         media_url=media_url,
         template_params=template_params,
         scheduled_at=payload.scheduled_at,
+        total_contacts=total_contacts
     )
     db.add(new_campaign)
     db.commit()
     db.refresh(new_campaign)
+
+    log_action(
+        db, "CREATE_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"campaign_id": str(new_campaign.id), "name": new_campaign.name},
+        request=request
+    )
+
     return new_campaign
 
 
@@ -136,17 +178,37 @@ def list_campaigns(
     limit: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    query = db.query(Campaign)
+    query = db.query(Campaign).filter(Campaign.is_deleted == False)
     if search:
         query = query.filter(Campaign.name.ilike(f"%{search}%"))
     if status:
         query = query.filter(Campaign.status == status)
     
     total = query.count()
-    items = query.order_by(Campaign.created_at.desc()).offset(skip).limit(limit).all()
+    
+    # Sorting
+    valid_columns = {
+        "name": Campaign.name,
+        "status": Campaign.status,
+        "template_name": Campaign.template_name,
+        "created_at": Campaign.created_at,
+        "sent_count": Campaign.sent_count
+    }
+    
+    target_col_name = sort_by if sort_by in valid_columns else "created_at"
+    sort_col = valid_columns[target_col_name]
+    
+    if sort_order.lower() == "asc":
+        query = query.order_by(sort_col.asc())
+    else:
+        query = query.order_by(sort_col.desc())
+
+    items = query.offset(skip).limit(limit).all()
     
     # Enrich with real-time stats (Rule: Always show correct data)
     enriched_items = []
@@ -169,14 +231,14 @@ def list_campaigns(
     }
 
 
-@router.get("/{campaign_id}", summary="Get Campaign Detail")
+@router.get("/{campaign_id}", summary="Get Campaign Detail", response_model=CampaignResponse)
 def get_campaign(
     campaign_id: uuid.UUID, 
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
     campaign = db.query(Campaign).get(campaign_id)
-    if not campaign:
+    if not campaign or campaign.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
@@ -184,6 +246,7 @@ def get_campaign(
 @router.post("/{campaign_id}/start", summary="Start or Schedule a Campaign")
 def start_campaign(
     campaign_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_user)
 ):
@@ -200,30 +263,53 @@ def start_campaign(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
 
+    log_action(
+        db, "START_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"campaign_id": str(campaign_id), "name": campaign.name},
+        request=request
+    )
+
     return result
 
 
 @router.post("/{campaign_id}/pause", summary="Pause a running campaign")
 def pause_campaign_route(
     campaign_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_user)
 ):
     result = pause_campaign(db, campaign_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    
+    log_action(
+        db, "PAUSE_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"campaign_id": str(campaign_id)},
+        request=request
+    )
     return result
 
 
 @router.post("/{campaign_id}/resume", summary="Resume a paused campaign")
 def resume_campaign_route(
     campaign_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_user)
 ):
     result = resume_campaign(db, campaign_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    
+    log_action(
+        db, "RESUME_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"campaign_id": str(campaign_id)},
+        request=request
+    )
     return result
 
 
@@ -245,50 +331,26 @@ def get_campaign_stats(
             "status": campaign.status,
             "on_hold_count": campaign.on_hold_count,
             "failure_reason": campaign.failure_reason,
-            "total_cost_inr": campaign.total_cost_inr
         }
     }
 
 
-@router.get("/system/balance", summary="Get Meta Balance & Settings")
-def get_system_balance(
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(admin_only)
-):
-    settings = SystemSettings.get_settings(db)
-    return settings
-
-
-@router.post("/system/balance", summary="Update Meta Balance (Recharge)")
-def update_system_balance(
-    amount: float, 
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(admin_only)
-):
-    settings = SystemSettings.get_settings(db)
-    settings.meta_balance_inr += amount
-    # Assuming 84 for USD sync
-    settings.meta_balance_usd += (amount / 84)
-    db.commit()
-    db.refresh(settings)
-    return {"message": "Balance updated", "new_balance": settings.meta_balance_inr}
-
-
-@router.delete("/{campaign_id}", summary="Delete a Campaign")
-def delete_campaign(
-    campaign_id: uuid.UUID, 
+@router.get("/{campaign_id}/logs", summary="Get Granular Campaign Logs")
+def get_campaign_logs_route(
+    campaign_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
-    campaign = db.query(Campaign).get(campaign_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.status == "running":
-        raise HTTPException(status_code=400, detail="Cannot delete a running campaign")
-    db.delete(campaign)
-    db.commit()
-    return {"message": "Campaign deleted"}
+    """
+    Returns a list of all recipients and their current message status for this campaign.
+    """
+    return get_campaign_detailed_logs(db, str(campaign_id), skip=skip, limit=limit)
 
+
+# BE-FIX BE-15: These specific routes MUST come BEFORE /{campaign_id} to avoid
+# FastAPI treating 'active' and 'system' as UUID path parameters (returns 422).
 
 @router.get("/active/progress", summary="Get Live Progress of Running Campaigns")
 def get_active_campaigns_progress(
@@ -297,16 +359,16 @@ def get_active_campaigns_progress(
 ):
     """
     Get progress of all currently running campaigns for global status bar.
+    This route MUST be registered before /{campaign_id} to avoid 422 errors.
     """
-    active_campaigns = db.query(Campaign).filter(Campaign.status == "running").all()
+    logger.info("CampaignRoutes: Fetching active campaigns progress")
+    active_campaigns = db.query(Campaign).filter(Campaign.status == "running", Campaign.is_deleted == False).all()
     results = []
     for c in active_campaigns:
-        # Re-using the analytics service for consistency
         analytics = get_campaign_analytics(db, str(c.id))
         sent = analytics.get("total_sent", 0)
         total = c.total_contacts or 0
         progress = round((sent / total * 100), 1) if total > 0 else 0
-        
         results.append({
             "id": str(c.id),
             "name": c.name,
@@ -314,5 +376,65 @@ def get_active_campaigns_progress(
             "sent": sent,
             "total": total
         })
-    
     return results
+
+
+@router.get("/system/balance", summary="Get Meta Balance & Settings")
+def get_system_balance(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(admin_only)
+):
+    logger.info("CampaignRoutes: Fetching system balance")
+    settings = SystemSettings.get_settings(db)
+    return settings
+
+
+@router.post("/system/balance", summary="Update Meta Balance (Recharge)")
+def update_system_balance(
+    amount: float,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(admin_only)
+):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Recharge amount must be positive")
+    settings = SystemSettings.get_settings(db)
+    rate = settings.exchange_rate or 84.0
+    settings.meta_balance_inr += amount
+    settings.meta_balance_usd += round(amount / rate, 2)
+    db.commit()
+    db.refresh(settings)
+    logger.info(f"CampaignRoutes: Balance updated by ₹{amount}. New balance: ₹{settings.meta_balance_inr}")
+    
+    log_action(
+        db, "UPDATE_BALANCE", "SYSTEM", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"recharge_amount": amount, "new_balance": settings.meta_balance_inr},
+        request=request
+    )
+
+    return {"message": "Balance updated", "new_balance": settings.meta_balance_inr}
+
+
+@router.delete("/{campaign_id}", summary="Delete a Campaign")
+def delete_campaign(
+    campaign_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(any_agent)
+):
+    campaign = db.query(Campaign).get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    logger.info(f"CampaignRoutes: Soft deleting campaign {campaign_id} (status={campaign.status}) by {current_user.username}")
+    campaign.is_deleted = True
+    db.commit()
+
+    log_action(
+        db, "DELETE_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"campaign_id": str(campaign_id), "name": campaign.name},
+        request=request
+    )
+
+    return {"message": "Campaign deleted"}

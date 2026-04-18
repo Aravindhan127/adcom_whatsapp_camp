@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
 
     # Redis
-    # Redis (Forced to 127.0.0.1 for maximum Windows/Docker compatibility)
-    REDIS_URL: str = os.getenv("REDIS_URL") or "redis://127.0.0.1:6379/0"
+    # Redis (Uses remote instance from .env)
+    REDIS_URL: str = os.getenv("REDIS_URL")
 
     # CORS Origins (comma-separated)
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")

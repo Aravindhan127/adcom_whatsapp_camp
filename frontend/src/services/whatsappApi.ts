@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_BASE = import.meta.env.VITE_API_BACKEND_URL_WHATSAPP || 'http://localhost:8000';
+export const API_BASE = import.meta.env.VITE_API_BACKEND_URL_WHATSAPP || 'http://localhost:8000';
 
 // SECURITY: Add timeout and CSRF protection
 const whatsappClient = axios.create({
@@ -40,6 +40,7 @@ whatsappClient.interceptors.response.use(
 export interface Conversation {
     sessionId: string;
     phoneNumber: string;
+    contactName?: string;
     lastMessage: string;
     timestamp: string;
     unreadCount: number;
@@ -67,7 +68,10 @@ export interface Template {
     components: any[];
     rejection_reason?: string;
     last_synced_at?: string;
+    created_at?: string;
+    variable_mappings?: Record<string, string>;
 }
+
 
 export interface ContactList {
     id: string;
@@ -86,6 +90,7 @@ export interface Campaign {
     delivered_count: number;
     read_count: number;
     failed_count: number;
+    failure_reason?: string | null;
     scheduled_at: string | null;
     created_at: string;
     completed_at: string | null;
@@ -174,16 +179,35 @@ export const whatsappApi = {
         return res.data || [];
     },
 
-    getContacts: async (params?: { limit?: number; offset?: number; search?: string; status?: string; category?: string; list_id?: string }) => {
+    getContacts: async (params?: {
+        limit?: number;
+        offset?: number;
+        search?: string;
+        status?: string;
+        category?: string;
+        list_id?: string;
+        company_name?: string;
+        lead_source?: string;
+        customer_category?: string;
+        customer_stage?: string;
+        city?: string;
+        sort_by?: string;
+        sort_order?: string;
+    }) => {
         const res = await whatsappClient.get('/api/contacts/', { params });
         return res.data as { total: number; items: any[]; limit: number; offset: number };
     },
 
-    createContact: async (payload: { 
-        phone_number: string; 
-        name?: string; 
-        category?: string; 
-        list_id?: string; 
+    getContactFilterOptions: async () => {
+        const res = await whatsappClient.get('/api/contacts/filter-options');
+        return res.data as { categories: string[]; stages: string[]; cities: string[]; sources: string[] };
+    },
+
+    createContact: async (payload: {
+        phone_number: string;
+        name?: string;
+        category?: string;
+        list_id?: string;
         upsert?: boolean;
         company_name?: string;
         lead_source?: string;
@@ -233,10 +257,27 @@ export const whatsappApi = {
     },
 
     // ── Templates ─────────────────────────────────────────────
-    getTemplates: async (): Promise<Template[]> => {
-        const res = await whatsappClient.get('/api/templates/');
-        return res.data || [];
+    getTemplates: async (params?: {
+        status?: string;
+        search?: string;
+        category?: string;
+        skip?: number;
+        limit?: number;
+        sort_by?: string;
+        sort_order?: string;
+    }): Promise<{ total: number; items: Template[] }> => {
+        const res = await whatsappClient.get('/api/templates/', { params });
+        // Robustness: Handle if backend still returns an array instead of paginated object
+        if (Array.isArray(res.data)) {
+            return { total: res.data.length, items: res.data };
+        }
+        return {
+            total: res.data?.total || 0,
+            items: res.data?.items || []
+        };
     },
+
+
 
     syncTemplates: async () => {
         const res = await whatsappClient.post('/api/templates/sync');
@@ -292,7 +333,14 @@ export const whatsappApi = {
     },
 
     // ── Campaigns ─────────────────────────────────────────────
-    getCampaigns: async (params?: { skip?: number; limit?: number; search?: string; status?: string }): Promise<{ items: Campaign[]; total: number }> => {
+    getCampaigns: async (params?: {
+        skip?: number;
+        limit?: number;
+        search?: string;
+        status?: string;
+        sort_by?: string;
+        sort_order?: string;
+    }): Promise<{ items: Campaign[]; total: number }> => {
         const res = await whatsappClient.get('/api/campaigns/', { params });
         return {
             items: res.data.items || [],
@@ -342,24 +390,31 @@ export const whatsappApi = {
         return res.data;
     },
 
+    getCampaignLogs: async (campaignId: string, params?: { skip?: number; limit?: number }) => {
+        const res = await whatsappClient.get(`/api/campaigns/${campaignId}/logs`, { params });
+        return res.data as { total: number; items: any[] };
+    },
+
     deleteCampaign: async (campaignId: string) => {
         const res = await whatsappClient.delete(`/api/campaigns/${campaignId}`);
         return res.data;
     },
 
     // ── Dashboard ─────────────────────────────────────────────
-    getStats: async (): Promise<DashboardStats> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/stats');
+    getStats: async (campaignId?: string): Promise<DashboardStats> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/stats', { params: { campaign_id: campaignId } });
         return res.data;
     },
-    getTrends: async (days: number = 7): Promise<any[]> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/trends', { params: { days } });
+    getTrends: async (days: number = 7, campaignId?: string): Promise<any[]> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/trends', { params: { days, campaign_id: campaignId } });
         return res.data || [];
     },
-    getRecentActivity: async (limit: number = 5): Promise<any[]> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/activity', { params: { limit } });
+    getRecentActivity: async (limit: number = 5, hours: number = 24, campaignId?: string): Promise<any[]> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/activity', { params: { limit, hours, campaign_id: campaignId } });
         return res.data || [];
     },
+
+
 
     // ── Health & Global Status ────────────────────────────────
     getHealthSummary: async () => {
@@ -370,5 +425,22 @@ export const whatsappApi = {
     getActiveProgress: async () => {
         const res = await whatsappClient.get('/api/campaigns/active/progress');
         return res.data as { id: string; name: string; progress: number; sent: number; total: number }[];
+    },
+
+    // ── System ────────────────────────────────────────────────
+    getExchangeRate: async () => {
+        const res = await whatsappClient.get('/api/system/currency');
+        return res.data as { exchange_rate: number; last_updated: string };
+    },
+
+    syncExchangeRate: async () => {
+        const res = await whatsappClient.post('/api/system/currency/sync');
+        return res.data as { message: string; rate: number };
+    },
+
+    // ── Audit ──────────────────────────────────────────────────
+    getAuditLogs: async (params?: { skip?: number; limit?: number; module?: string; action?: string }) => {
+        const res = await whatsappClient.get('/api/audit/logs', { params });
+        return res.data as { total: number; items: any[]; skip: number; limit: number };
     },
 };

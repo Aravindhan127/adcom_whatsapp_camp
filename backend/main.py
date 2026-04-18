@@ -64,7 +64,8 @@ def migrate_db():
             ('total_cost_usd', "DOUBLE PRECISION DEFAULT 0.0"),
             ('media_url', "TEXT"),
             ('scheduled_at', "TIMESTAMP WITH TIME ZONE"),
-            ('completed_at', "TIMESTAMP WITH TIME ZONE")
+            ('completed_at', "TIMESTAMP WITH TIME ZONE"),
+            ('is_deleted', "BOOLEAN DEFAULT FALSE")
         ]
         for col, col_type in updates:
             if col not in camp_cols:
@@ -146,12 +147,43 @@ try:
 except Exception as e:
     logger.error(f"Adcom DB Initialization Failed: {str(e)}")
 
-app = FastAPI(title="Adcom WhatsApp Standalone (Latest Branch Sync)", description="FastAPI + Groq + Meta WhatsApp v21.0")
+# --- SSL Configuration ---
+SSL_CERT_FILE = r"C:\ssl\www_ttcitaloraa_shop.crt"
+SSL_KEY_FILE  = r"C:\ssl\www_ttcitaloraa_shop.key"   # Place your private key here
+
+# Detect if SSL is available
+_ssl_available = os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE)
+
+# Swagger / OpenAPI server URL
+_base_url = "https://www.ttcitaloraa.shop" if _ssl_available else "http://localhost:3000"
+
+app = FastAPI(
+    title="Adcom WhatsApp Standalone (Latest Branch Sync)",
+    description="FastAPI + Groq + Meta WhatsApp v21.0",
+    version="2.0.0",
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    servers=[
+        {"url": _base_url, "description": "Production (HTTPS)" if _ssl_available else "Local Dev"},
+        {"url": "http://localhost:3000", "description": "Local Dev (HTTP)"},
+    ],
+)
 
 @app.on_event("startup")
 async def startup_event():
     # Start the WebSocket Redis listener task
     asyncio.create_task(manager.listen_for_events())
+    
+    # Sync live exchange rate on startup
+    from app.services.currency_service import update_system_exchange_rate
+    db = SessionLocal()
+    try:
+        update_system_exchange_rate(db)
+        logger.info("Adcom API: Startup exchange rate sync completed.")
+    finally:
+        db.close()
+        
     logger.info("Adcom API: WebSocket Redis listener started.")
 
 # Configure CORS - Parse origins from settings
@@ -230,6 +262,16 @@ async def global_exception_handler(request: Request, exc: Exception):
 def read_root():
     return {"message": "Adcom Standalone API (v2 Latest) is running", "status": "online"}
 
+@app.get("/api/doc")
+def redirect_api_doc():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/docs")
+
+@app.get("/api/docs")
+def redirect_api_docs():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/docs")
+
 @app.get("/api/health/db")
 async def health_check_db(db: Session = Depends(get_db)):
     """Check database connectivity and latency."""
@@ -279,7 +321,9 @@ from app.routes import (
     webhook_routes, 
     template_routes,
     analytics_routes,
-    campaign_routes
+    campaign_routes,
+    system_routes,
+    audit_routes
 )
 
 # Include Routers
@@ -291,6 +335,8 @@ app.include_router(whatsapp_routes.router, prefix="/api")
 app.include_router(contact_routes.router, prefix="/api")
 app.include_router(analytics_routes.router, prefix="/api")
 app.include_router(campaign_routes.router, prefix="/api")
+app.include_router(system_routes.router, prefix="/api")
+app.include_router(audit_routes.router, prefix="/api")
 
 # --- WebSocket Endpoint ---
 from app.core.websocket_manager import manager
@@ -311,5 +357,44 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import threading
+    from fastapi import FastAPI as _FastAPI
+    from fastapi.responses import RedirectResponse as _RedirectResponse
+
+    if _ssl_available:
+        # --- HTTP → HTTPS Redirect App (port 80) ---
+        http_redirect_app = _FastAPI()
+
+        @http_redirect_app.middleware("http")
+        async def redirect_to_https(request: Request, call_next):
+            https_url = str(request.url).replace("http://", "https://", 1)
+            # Strip port 80 from URL if present
+            https_url = https_url.replace(":80/", "/").replace(":80", "")
+            return _RedirectResponse(url=https_url, status_code=301)
+
+        def run_http_redirect():
+            import uvicorn as _uvicorn
+            logger.info("Starting HTTP → HTTPS redirect server on port 80")
+            _uvicorn.run(http_redirect_app, host="0.0.0.0", port=80)
+
+        # Start port 80 redirect in background thread
+        redirect_thread = threading.Thread(target=run_http_redirect, daemon=True)
+        redirect_thread.start()
+
+        # Start main HTTPS app on port 443
+        logger.info(f"Starting HTTPS server on port 443 | cert={SSL_CERT_FILE}")
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=443,
+            ssl_certfile=SSL_CERT_FILE,
+            ssl_keyfile=SSL_KEY_FILE,
+        )
+    else:
+        logger.warning(
+            "SSL key file not found at C:\\ssl\\www_ttcitaloraa_shop.key — "
+            "starting on port 3000 (HTTP only)."
+        )
+        uvicorn.run(app, host="0.0.0.0", port=3000)
+
 

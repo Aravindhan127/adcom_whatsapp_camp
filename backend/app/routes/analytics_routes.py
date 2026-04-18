@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Optional
+
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.core.database import get_db
@@ -16,6 +18,7 @@ router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
 @router.get("/dashboard/stats")
 def get_dashboard_stats(
+    campaign_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -23,7 +26,7 @@ def get_dashboard_stats(
     Aggregate summary stats for the Dashboard page.
     """
     try:
-        return get_dashboard_stats_service(db)
+        return get_dashboard_stats_service(db, campaign_id)
     except Exception as e:
         import traceback
         print(f"ERROR calculating dashboard stats: {str(e)}")
@@ -48,6 +51,7 @@ def get_campaign_stats(
 @router.get("/dashboard/trends")
 def get_dashboard_trends(
     days: int = Query(7, ge=1, le=30),
+    campaign_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -55,7 +59,7 @@ def get_dashboard_trends(
     Get message trends for the last X days.
     """
     try:
-        return get_messaging_trends(db, days)
+        return get_messaging_trends(db, days, campaign_id)
     except Exception as e:
         print(f"ERROR calculating trends: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Trends error: {str(e)}")
@@ -63,6 +67,8 @@ def get_dashboard_trends(
 @router.get("/dashboard/activity")
 def get_dashboard_activity(
     limit: int = 5,
+    hours: int = 24,
+    campaign_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -71,8 +77,10 @@ def get_dashboard_activity(
     """
     try:
         from app.services.analytics_service import get_recent_activity
-        return get_recent_activity(db, limit)
+        return get_recent_activity(db, limit, hours, campaign_id)
     except Exception as e:
         print(f"ERROR fetching activity: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Activity error: {str(e)}")
+
+
 

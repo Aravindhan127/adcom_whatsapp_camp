@@ -8,10 +8,12 @@ import Chat from './pages/Chat.tsx';
 import Contacts from './pages/Contacts.tsx';
 import Campaigns from './pages/Campaigns.tsx';
 import Templates from './pages/Templates.tsx';
+import AuditLogs from './pages/AuditLogs.tsx';
 import Settings from './pages/Settings.tsx';
 import ForgotPassword from './pages/ForgotPassword.tsx';
 import ResetPassword from './pages/ResetPassword.tsx';
 import { ThemeProvider } from './components/ThemeProvider';
+import { ToastProvider } from './components/Toast';
 import './index.css';
 
 // Simple check for auth (checks presence and expiration)
@@ -25,7 +27,10 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
     const currentTime = Date.now() / 1000;
     
     // If token is expired, clear it and redirect
-    if (decoded.exp && decoded.exp < currentTime) {
+    // FE-FIX FE-14: Added 30s clock skew buffer — minor browser/server time differences
+    // caused valid tokens to appear expired, kicking users to login unexpectedly.
+    const CLOCK_SKEW_TOLERANCE_SECONDS = 30;
+    if (decoded.exp && decoded.exp < (currentTime - CLOCK_SKEW_TOLERANCE_SECONDS)) {
       localStorage.removeItem('token');
       return <Navigate to="/login" />;
     }
@@ -41,6 +46,7 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
 function App() {
   return (
     <ThemeProvider>
+      <ToastProvider>
       <Router>
         <Routes>
           <Route path="/login" element={<Login />} />
@@ -57,6 +63,7 @@ function App() {
                     <Route path="/campaigns" element={<Campaigns />} />
                     <Route path="/contacts" element={<Contacts />} />
                     <Route path="/templates" element={<Templates />} />
+                    <Route path="/audit" element={<AuditLogs />} />
                     <Route path="/chat" element={<Chat />} />
                     <Route path="/settings" element={<Settings />} />
                   </Routes>
@@ -66,6 +73,7 @@ function App() {
           />
         </Routes>
       </Router>
+      </ToastProvider>
     </ThemeProvider>
   );
 }

@@ -1,7 +1,7 @@
 import React from 'react';
 import { NavLink, useNavigate, useLocation, Outlet } from 'react-router-dom';
 import { ThemeToggle } from './ThemeToggle';
-import { LogOut, LayoutDashboard, Users, Send, ClipboardList, MessageSquare, Settings, Command } from 'lucide-react';
+import { LogOut, LayoutDashboard, Users, Send, ClipboardList, MessageSquare, Settings, Command, Shield } from 'lucide-react';
 import GlobalStatus from './GlobalStatus';
 
 const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -56,18 +56,32 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
         <div className="p-4 border-t border-slate-100 dark:border-slate-800 mt-auto space-y-1">
           {userRole === 'admin' && (
-            <NavLink
-              to="/settings"
-              className={({ isActive }) => `
-                flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
-                ${isActive 
-                  ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
-                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
-              `}
-            >
-              <Settings size={18} strokeWidth={2} />
-              Settings
-            </NavLink>
+            <>
+              <NavLink
+                to="/audit"
+                className={({ isActive }) => `
+                  flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
+                  ${isActive 
+                    ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
+                `}
+              >
+                <Shield size={18} strokeWidth={2} />
+                Audit Logs
+              </NavLink>
+              <NavLink
+                to="/settings"
+                className={({ isActive }) => `
+                  flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
+                  ${isActive 
+                    ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
+                `}
+              >
+                <Settings size={18} strokeWidth={2} />
+                Settings
+              </NavLink>
+            </>
           )}
           <button 
             onClick={handleLogout}
@@ -86,7 +100,7 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
       {/* Main Framework */}
       <main className="flex-1 overflow-auto bg-slate-50 dark:bg-slate-950 h-screen scrollbar-hide">
-        <div className="max-w-[1400px] mx-auto p-10">
+        <div className="p-8">
           {children || <Outlet />}
         </div>
       </main>

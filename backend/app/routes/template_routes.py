@@ -4,13 +4,22 @@ from app.core.database import get_db
 from app.models.template import WhatsAppTemplate
 from pydantic import BaseModel
 from typing import List, Optional
-from app.services.meta_api import create_meta_template, get_meta_templates_status, create_resumable_upload_session, upload_file_content, delete_meta_template
-from datetime import datetime
+from app.services.meta_api import (
+    create_meta_template, 
+    update_meta_template,
+    get_meta_templates_status, 
+    create_resumable_upload_session, 
+    upload_file_content, 
+    delete_meta_template
+)
+from datetime import datetime, timezone
 import uuid
 import logging
 from app.core.security import get_current_user, RoleChecker
 from app.models.agent import Agent
 from app.models.campaign import Campaign
+from app.services.audit_service import log_action
+from fastapi import Request
 
 import re
 
@@ -64,6 +73,7 @@ class TemplateCreate(BaseModel):
 @router.post("/")
 def create_template(
     template_in: TemplateCreate, 
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
@@ -85,7 +95,15 @@ def create_template(
             components=template_in.components
         )
         if "error" in meta_res:
-             raise HTTPException(status_code=400, detail=f"Meta Error: {meta_res['error']}")
+             error_msg = meta_res["error"]
+             subcode = str(meta_res.get("subcode", ""))
+             
+             if subcode == "2388023":
+                 error_msg = f"Template name lockout: {error_msg} (Error Code: 2388023). Meta does not allow reusing a name immediately after deletion. Please wait or use a different name."
+             elif subcode == "2388024":
+                 error_msg = f"Already Exists: {error_msg} (Error Code: 2388024). A template with this language already exists on Meta. Please click 'Sync Templates' or use a different name."
+             
+             raise HTTPException(status_code=400, detail=f"Meta Error: {error_msg}")
         
         meta_id = meta_res.get("id")
         status = "PENDING"
@@ -103,10 +121,19 @@ def create_template(
     db.add(new_template)
     db.commit()
     db.refresh(new_template)
+
+    log_action(
+        db, "CREATE_TEMPLATE", "TEMPLATES", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"template_name": new_template.name, "category": new_template.category, "submit_to_meta": template_in.submit_to_meta},
+        request=request
+    )
+
     return new_template
 
 @router.post("/sync")
 def sync_templates(
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(admin_only)
 ):
@@ -145,7 +172,7 @@ def sync_templates(
             local_tpl.language = language
             local_tpl.components = components
             local_tpl.meta_template_id = meta_id
-            local_tpl.last_synced_at = datetime.utcnow()
+            local_tpl.last_synced_at = datetime.now(timezone.utc)
             updated_count += 1
         else:
             new_tpl = WhatsAppTemplate(
@@ -156,7 +183,7 @@ def sync_templates(
                 status=status,
                 meta_template_id=meta_id,
                 rejection_reason=mt.get("rejection_reason"),
-                last_synced_at=datetime.utcnow()
+                last_synced_at=datetime.now(timezone.utc)
             )
             db.add(new_tpl)
             imported_count += 1
@@ -172,6 +199,14 @@ def sync_templates(
             cleaned_count += 1
 
     db.commit()
+
+    log_action(
+        db, "SYNC_TEMPLATES", "TEMPLATES", 
+        user_id=str(current_user.id), username=current_user.username,
+        details={"updated": updated_count, "imported": imported_count, "deleted": cleaned_count},
+        request=request
+    )
+
     return {
         "message": f"Sync complete: {updated_count} updated, {imported_count} imported, {cleaned_count} removed",
         "total_meta": len(meta_templates)
@@ -182,6 +217,11 @@ def list_templates(
     db: Session = Depends(get_db),
     status: Optional[str] = Query(None, description="Filter by status (e.g., APPROVED, PENDING)"),
     search: Optional[str] = Query(None, description="Search by template name"),
+    category: Optional[str] = Query(None, description="Filter by category (MARKETING, UTILITY, AUTHENTICATION)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     current_user: Agent = Depends(any_agent)
 ):
     query = db.query(WhatsAppTemplate)
@@ -189,10 +229,37 @@ def list_templates(
     if status:
         query = query.filter(WhatsAppTemplate.status == status.upper())
 
+    if category:
+        query = query.filter(WhatsAppTemplate.category.ilike(category))
+
+
     if search:
         query = query.filter(WhatsAppTemplate.name.ilike(f"%{search}%"))
 
-    return query.all()
+    total = query.count()
+    
+    # Sorting
+    valid_columns = {
+        "name": WhatsAppTemplate.name,
+        "status": WhatsAppTemplate.status,
+        "category": WhatsAppTemplate.category,
+        "language": WhatsAppTemplate.language,
+        "created_at": WhatsAppTemplate.created_at,
+        "last_synced_at": WhatsAppTemplate.last_synced_at
+    }
+    
+    target_col_name = sort_by if sort_by in valid_columns else "created_at"
+    sort_col = valid_columns[target_col_name]
+    
+    if sort_order.lower() == "asc":
+        query = query.order_by(sort_col.asc())
+    else:
+        query = query.order_by(sort_col.desc())
+
+    items = query.offset(skip).limit(limit).all()
+    
+    return {"total": total, "items": items}
+
 
 class TemplateConfigure(BaseModel):
     variable_mappings: Optional[dict] = None
@@ -227,7 +294,7 @@ def configure_template(
     return template
 
 
-@router.put("/{template_id}", summary="Edit Template (Delete + Recreate Logic)")
+@router.put("/{template_id}", summary="Edit Template (In-place Update)")
 def update_template(
     template_id: uuid.UUID,
     template_in: TemplateCreate,
@@ -236,11 +303,10 @@ def update_template(
 ):
     """
     Logic:
-    1. Check for name changes (not supported yet or requires separate logic)
-    2. Check if in use by active campaign (BLOCK if yes)
-    3. Delete old one from Meta
-    4. Re-create new one on Meta
-    5. Update local record
+    1. Check if in use by active campaign (BLOCK if yes)
+    2. If template has a meta_template_id, update it on Meta
+    3. If template is LOCAL_ONLY but submit_to_meta is True, create it on Meta
+    4. Update local record
     """
     template = db.query(WhatsAppTemplate).get(template_id)
     if not template:
@@ -256,28 +322,69 @@ def update_template(
     # 2. Validate: body must not end with a variable
     validate_template_body(template_in.components)
 
-    # 3. Delete from Meta if applicable
-    if template.status != "LOCAL_ONLY":
-        delete_meta_template(template.name, language=template.language)
-
-    # 3. Create fresh version on Meta
-    meta_id = None
-    status = "LOCAL_ONLY"
+    meta_id = template.meta_template_id
+    status = template.status
     
+    # 3. Handle Meta Integration
     if template_in.submit_to_meta:
-        meta_res = create_meta_template(
-            name=template_in.name,
-            category=template_in.category,
-            language=template_in.language,
-            components=template_in.components
-        )
-        if "error" in meta_res:
-             raise HTTPException(status_code=400, detail=f"Meta Error: {meta_res['error']}")
+        is_missing_on_meta = False
         
-        meta_id = meta_res.get("id")
-        status = "PENDING"
+        if meta_id:
+            # UPDATE existing template on Meta
+            meta_res = update_meta_template(
+                template_id=meta_id,
+                category=template_in.category,
+                components=template_in.components
+            )
+            
+            if "error" in meta_res:
+                 meta_error = meta_res.get("error", "").lower()
+                 meta_code = str(meta_res.get("code", ""))
+                 meta_subcode = str(meta_res.get("subcode", ""))
+                 
+                 # 1. Check if the error is specifically "Object does not exist" (Subcode 33)
+                 # This is the ONLY case where we fallback to creation.
+                 if meta_subcode == "33":
+                      logger.warning(f"Template ID {meta_id} not found on Meta. Falling back to creation.")
+                      is_missing_on_meta = True
+                 # 2. Handle specific policy errors that should BLOCK creation
+                 elif meta_subcode == "2388094":
+                      raise HTTPException(
+                          status_code=400, 
+                          detail="Meta Policy Error: Sample templates (like 'hello_world') cannot be edited or deleted. Please create a NEW template with a different name."
+                      )
+                 # 3. Handle other errors
+                 else:
+                      raise HTTPException(status_code=400, detail=f"Meta Update Error: {meta_res['error']}")
+            else:
+                 # Success
+                 status = "PENDING"
+        
+        # If it was never on Meta OR it's missing (is_missing_on_meta), we CREATE it
+        if not meta_id or is_missing_on_meta:
+            # CREATE new template on Meta
+            meta_res = create_meta_template(
+                name=template_in.name,
+                category=template_in.category,
+                language=template_in.language,
+                components=template_in.components
+            )
+            if "error" in meta_res:
+                 error_msg = meta_res["error"]
+                 subcode = str(meta_res.get("subcode", ""))
+                 
+                 if subcode == "2388023":
+                     error_msg = f"Template name lockout: {error_msg} (Error Code: 2388023). Meta does not allow reusing a name immediately after deletion. Please wait or use a different name."
+                 elif subcode == "2388024":
+                     error_msg = f"Already Exists: {error_msg} (Error Code: 2388024). Meta already has a template with this name. Please click 'Sync Templates' or use a different name."
+                 
+                 raise HTTPException(status_code=400, detail=f"Meta Creation Error: {error_msg}")
+            
+            meta_id = meta_res.get("id")
+            status = "PENDING"
 
-    # 4. Update existing local record
+
+    # 4. Update local record
     template.name = template_in.name
     template.category = template_in.category
     template.language = template_in.language
@@ -286,11 +393,12 @@ def update_template(
     template.media_id = template_in.media_id
     template.meta_template_id = meta_id
     template.status = status
-    template.last_synced_at = datetime.utcnow()
+    template.last_synced_at = datetime.now(timezone.utc)
 
     db.commit()
     db.refresh(template)
     return template
+
 
 @router.get("/{template_id}")
 def get_template(
@@ -307,6 +415,7 @@ def get_template(
 @router.delete("/{template_id}")
 def delete_template(
     template_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(admin_only)
 ):
@@ -363,6 +472,14 @@ def delete_template(
         # Hard delete: remove from local DB
         db.delete(template)
         db.commit()
+
+        log_action(
+            db, "DELETE_TEMPLATE", "TEMPLATES", 
+            user_id=str(current_user.id), username=current_user.username,
+            details={"template_name": template_name},
+            request=request
+        )
+
         return {"message": f"Template '{template_name}' deleted successfully from Meta and local database."}
     except HTTPException:
         raise

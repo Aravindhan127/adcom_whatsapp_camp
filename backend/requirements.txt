@@ -26,3 +26,5 @@ passlib[bcrypt]
 pyjwt
 pydantic-settings
 python-jose[cryptography]
+openpyxl
+xlrd

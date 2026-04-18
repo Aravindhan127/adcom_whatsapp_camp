@@ -3,7 +3,9 @@ from sqlalchemy import func, case
 from app.models.campaign_run import CampaignRun
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.settings import SystemSettings
-from typing import Dict, List
+from app.models.campaign import Campaign
+from app.models.contact import Contact
+from typing import Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
 def get_campaign_analytics(db: Session, campaign_id: str) -> Dict:
@@ -40,13 +42,21 @@ def get_campaign_analytics(db: Session, campaign_id: str) -> Dict:
         "read_rate": (read / total_sent * 100) if total_sent > 0 else 0
     }
 
-def _get_period_stats(db: Session, start: datetime, end: datetime) -> Dict:
+def _get_period_stats(db: Session, start: datetime, end: datetime, campaign_id: Optional[str] = None) -> Dict:
     """Helper to fetch stats for a specific timeframe."""
-    msgs = db.query(WhatsAppMessage).filter(
+    query = db.query(WhatsAppMessage).join(
+        Campaign, WhatsAppMessage.campaign_id == Campaign.id
+    ).filter(
+        Campaign.is_deleted == False,
         WhatsAppMessage.direction == "out",
         WhatsAppMessage.created_at >= start,
         WhatsAppMessage.created_at < end
-    ).all()
+    )
+    
+    if campaign_id:
+        query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+        
+    msgs = query.all()
     
     total = len(msgs)
     delivered = sum(1 for m in msgs if m.delivery_status in ["delivered", "read"])
@@ -63,7 +73,7 @@ def _get_period_stats(db: Session, start: datetime, end: datetime) -> Dict:
         "read_rate": (read / delivered * 100) if delivered > 0 else 0
     }
 
-def get_dashboard_stats_service(db: Session) -> Dict:
+def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) -> Dict:
     """
     Aggregate overall dashboard statistics for the professional UI.
     Now includes 24h vs Previous 24h trend calculations.
@@ -73,22 +83,41 @@ def get_dashboard_stats_service(db: Session) -> Dict:
     t48h = now - timedelta(hours=48)
 
     # 1. Overall Totals
-    total = db.query(WhatsAppMessage).filter(WhatsAppMessage.direction == "out").count()
-    delivered = db.query(WhatsAppMessage).filter(WhatsAppMessage.delivery_status.in_(["delivered", "read"])).count()
-    read = db.query(WhatsAppMessage).filter(WhatsAppMessage.delivery_status == "read").count()
-    failed = db.query(WhatsAppMessage).filter(WhatsAppMessage.delivery_status == "failed").count()
+    query = db.query(WhatsAppMessage).join(
+        Campaign, WhatsAppMessage.campaign_id == Campaign.id
+    ).filter(
+        Campaign.is_deleted == False,
+        WhatsAppMessage.direction == "out"
+    )
+    if campaign_id:
+        query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+        
+    total = query.count()
+    delivered = query.filter(WhatsAppMessage.delivery_status.in_(["delivered", "read"])).count()
+    read = query.filter(WhatsAppMessage.delivery_status == "read").count()
+    failed = query.filter(WhatsAppMessage.delivery_status == "failed").count()
     
     # Rule: Total spend calculation must include both WhatsApp business costs and AI integration costs
-    total_spend_inr = db.query(
+    spend_query = db.query(
         func.sum(
             func.coalesce(WhatsAppMessage.llm_cost_inr, 0.0) + 
             func.coalesce(WhatsAppMessage.whatsapp_cost, 0.0)
         )
-    ).scalar() or 0.0
+    ).join(
+        Campaign, WhatsAppMessage.campaign_id == Campaign.id
+    ).filter(
+        Campaign.is_deleted == False,
+        WhatsAppMessage.direction == "out"
+    )
+    
+    if campaign_id:
+        spend_query = spend_query.filter(WhatsAppMessage.campaign_id == campaign_id)
+        
+    total_spend_inr = spend_query.scalar() or 0.0
 
     # 2. Period Comparisons (Last 24h vs Previous 24h)
-    curr = _get_period_stats(db, t24h, now)
-    prev = _get_period_stats(db, t48h, t24h)
+    curr = _get_period_stats(db, t24h, now, campaign_id)
+    prev = _get_period_stats(db, t48h, t24h, campaign_id)
 
     def calc_trend(current, previous):
         if previous == 0: return 0.0 if current == 0 else 100.0
@@ -130,23 +159,31 @@ def get_dashboard_stats_service(db: Session) -> Dict:
         }
     }
 
-def get_messaging_trends(db: Session, days: int = 7) -> List[Dict]:
+def get_messaging_trends(db: Session, days: int = 7, campaign_id: Optional[str] = None) -> List[Dict]:
     """
     Get message counts (sent, delivered, read) grouped by day.
     """
-    end_date = datetime.utcnow()
+    end_date = datetime.now(timezone.utc)  # BE-FIX BE-13: deprecated utcnow() replaced
     start_date = end_date - timedelta(days=days-1)
     
     # Query for daily aggregates
-    stats = db.query(
+    query = db.query(
         func.date(WhatsAppMessage.created_at).label('date'),
         func.count(WhatsAppMessage.id).label('sent'),
         func.sum(case((WhatsAppMessage.delivery_status.in_(["delivered", "read"]), 1), else_=0)).label('delivered'),
         func.sum(case((WhatsAppMessage.delivery_status == "read", 1), else_=0)).label('read')
+    ).join(
+        Campaign, WhatsAppMessage.campaign_id == Campaign.id
     ).filter(
+        Campaign.is_deleted == False,
         WhatsAppMessage.direction == "out",
         WhatsAppMessage.created_at >= start_date
-    ).group_by(
+    )
+    
+    if campaign_id:
+        query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+        
+    stats = query.group_by(
         func.date(WhatsAppMessage.created_at)
     ).order_by(
         func.date(WhatsAppMessage.created_at)
@@ -171,16 +208,35 @@ def get_messaging_trends(db: Session, days: int = 7) -> List[Dict]:
         
     return results
 
-def get_recent_activity(db: Session, limit: int = 5) -> List[Dict]:
+def get_recent_activity(db: Session, limit: int = 5, hours: int = 24, campaign_id: Optional[str] = None) -> List[Dict]:
     """
     Get the most recent outbound messages for the activity feed.
+    Defaults to last 24 hours.
     """
-    messages = db.query(WhatsAppMessage).order_by(
+    # Join with Campaign to get the campaign name and Contact to get contact names
+    query = db.query(WhatsAppMessage, Campaign.name, Contact.name).join(
+        Campaign, (WhatsAppMessage.campaign_id == Campaign.id)
+    ).outerjoin(
+        Contact, func.right(WhatsAppMessage.wa_id, 10) == func.right(Contact.phone_number, 10)
+    ).filter(
+        Campaign.is_deleted == False
+    )
+    
+    if hours > 0:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        query = query.filter(WhatsAppMessage.created_at >= since)
+        
+    if campaign_id:
+        query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+        
+    results_raw = query.order_by(
         WhatsAppMessage.created_at.desc()
     ).limit(limit).all()
     
     results = []
-    for m in messages:
+    now_utc = datetime.now(timezone.utc)
+    
+    for m, campaign_name, contact_name in results_raw:
         # Map statuses to colors for the UI
         color = "indigo"
         status_label = m.delivery_status.upper() if m.delivery_status else "SENT"
@@ -190,18 +246,74 @@ def get_recent_activity(db: Session, limit: int = 5) -> List[Dict]:
         elif m.delivery_status == "failed": color = "rose"
         elif m.delivery_status == "pending": color = "amber"
 
-        # Format time ago (rough)
-        diff = datetime.utcnow() - m.created_at.replace(tzinfo=None)
-        if diff.seconds < 60: time_str = "Just now"
-        elif diff.seconds < 3600: time_str = f"{diff.seconds // 60}m ago"
-        elif diff.days < 1: time_str = f"{diff.seconds // 3600}h ago"
-        else: time_str = f"{diff.days}d ago"
+        # BE-FIX: Correct timezone handling for "time ago" string
+        # m.created_at is timezone-aware (IST in our case). 
+        # Convert to UTC to compare with now_utc.
+        m_utc = m.created_at.astimezone(timezone.utc)
+        diff = now_utc - m_utc
+        
+        total_seconds = int(diff.total_seconds())
+        
+        if total_seconds < 0:
+            time_str = "Just now" # Future time due to clock drift
+        elif total_seconds < 60:
+            time_str = "Just now"
+        elif total_seconds < 3600:
+            time_str = f"{total_seconds // 60}m ago"
+        elif total_seconds < 86400:
+            time_str = f"{total_seconds // 3600}h ago"
+        else:
+            time_str = f"{total_seconds // 86400}d ago"
+
+        # Add exact clock time (formatted in local time stored in DB)
+        exact_time = m.created_at.strftime("%I:%M %p")
 
         results.append({
             "user": m.wa_id,
+            "user_name": contact_name or m.wa_id,
+            "campaign": campaign_name or "Direct",
             "msg": m.template_name or "Direct Message",
             "time": time_str,
+            "exact_time": exact_time,
             "status": status_label,
             "color": color
         })
     return results
+
+def get_campaign_detailed_logs(db: Session, campaign_id: str, skip: int = 0, limit: int = 100) -> Dict:
+    """
+    Get all message statuses for a specific campaign, joined with contact names.
+    """
+    from app.models.contact import Contact
+    
+    query = db.query(
+        WhatsAppMessage.wa_id,
+        WhatsAppMessage.delivery_status,
+        WhatsAppMessage.status_error,
+        WhatsAppMessage.created_at,
+        Contact.name.label("contact_name")
+    ).outerjoin(
+        Contact, func.right(WhatsAppMessage.wa_id, 10) == func.right(Contact.phone_number, 10)
+    ).filter(
+        WhatsAppMessage.campaign_id == campaign_id,
+        WhatsAppMessage.direction == "out"
+    )
+    
+    total = query.count()
+    items_raw = query.order_by(WhatsAppMessage.created_at.desc()).offset(skip).limit(limit).all()
+    
+    items = []
+    for row in items_raw:
+        items.append({
+            "phone": row.wa_id,
+            "name": row.contact_name or "Unknown",
+            "status": row.delivery_status or "sent",
+            "error": row.status_error,
+            "timestamp": row.created_at.isoformat()
+        })
+        
+    return {
+        "total": total,
+        "items": items
+    }
+
