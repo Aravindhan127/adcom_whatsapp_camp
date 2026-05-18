@@ -282,18 +282,26 @@ async def receive_webhook(
                                 # BE-FIX: Capture detailed error reason from Meta (Rule: Log visibility)
                                 if new_status == "failed":
                                     errors = status.get("errors", [])
+                                    is_cooldown = False
                                     if errors and isinstance(errors, list) and len(errors) > 0:
                                         err = errors[0]
+                                        code = err.get("code")
+                                        err_msg = err.get("message") or err.get("title") or ""
+                                        is_cooldown = (code == 131049 or "131049" in str(err_msg))
+                                        
                                         # Map webhook error fields to format_meta_error structure
                                         error_payload = {
-                                            "code": err.get("code"),
+                                            "code": code,
                                             "subcode": err.get("error_subcode"),
-                                            "error": err.get("message") or err.get("title") or "Meta delivery failed",
+                                            "error": err_msg or "Meta delivery failed",
                                             "fbtrace_id": err.get("fbtrace_id")
                                         }
                                         msg.status_error = format_meta_error(error_payload)
                                     else:
                                         msg.status_error = "Meta delivery failed"
+                                        
+                                    if is_cooldown:
+                                        new_status = "cooldown"
                                 
                                 # 3. Handle Billing Finalization (Rule: Legacy Compatibility)
                                 # This updates conversation costs and billing status in the DB.
