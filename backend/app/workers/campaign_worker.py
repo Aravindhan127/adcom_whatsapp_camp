@@ -1009,3 +1009,94 @@ def auto_process_all_cooldowns():
         return f"Error: {str(e)}"
     finally:
         db.close()
+
+
+@celery_app.task(name="app.workers.campaign_worker.send_link_click_acknowledgment")
+def send_link_click_acknowledgment(wa_id: str, destination_url: str, campaign_id: str):
+    """Sends an AI generated acknowledgment to a user when they click a tracked link."""
+    db = SessionLocal()
+    try:
+        from app.models.campaign import Campaign
+        from app.models.organization import OrganizationConfig
+        from app.services.meta_api import send_whatsapp_message as meta_send_msg
+        from app.services.ai_brain import chat_with_knowledge
+        from app.models.whatsapp_chat_model import WhatsAppMessage
+        from app.services.billing import ensure_conversation
+        
+        campaign = db.query(Campaign).get(campaign_id)
+        if not campaign:
+            return "Campaign not found"
+            
+        config = db.query(OrganizationConfig).filter(OrganizationConfig.organization_id == campaign.organization_id).first()
+        if not config or not config.access_token:
+            from app.models.settings import SystemSettings
+            sys_settings = SystemSettings.get_settings(db)
+            token = sys_settings.whatsapp_token
+            phone_id = sys_settings.phone_number_id
+        else:
+            token = config.access_token
+            phone_id = config.phone_number_id
+            
+        # Use AI Brain to generate a context aware thank you acknowledgment
+        logger.info(f"Link click AI acknowledgment: Generating response for {wa_id}...")
+        prompt = f"The user just clicked our tracked URL link: '{destination_url}' in their chat. Please write a very short, polite, and helpful thank you/acknowledgment message (1-2 sentences maximum) to send to them."
+        ai_res = chat_with_knowledge(
+            query=prompt,
+            context="You are a professional assistant. When a user clicks our website link, thank them politely."
+        )
+        ack_text = ai_res.get("response", "Thank you for visiting our link! Let us know if you need any assistance.")
+        
+        # Send message
+        meta_send_msg(to=wa_id, text=ack_text, token=token, phone_id=phone_id)
+        
+        # Save in DB message log
+        conv_data = ensure_conversation(db, wa_id, "service", organization_id=campaign.organization_id)
+        conv = conv_data["conversation"]
+        
+        ai_msg = WhatsAppMessage(
+            wa_id=wa_id, direction="out", message=ack_text,
+            conversation_id=conv.id, campaign_id=campaign.id
+        )
+        db.add(ai_msg)
+        db.commit()
+        
+        # Notify WebSocket UI
+        from app.core.websocket_manager import manager
+        import asyncio
+        
+        # Broadcast real-time websocket message to update chat screen instantly
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(manager.broadcast({
+                "type": "new_message",
+                "wa_id": wa_id,
+                "message": {
+                    "id": str(ai_msg.id),
+                    "text": ack_text,
+                    "sender": "agent",
+                    "timestamp": ai_msg.created_at.isoformat() if ai_msg.created_at else datetime.now().isoformat()
+                }
+            }), loop)
+        else:
+            loop.run_until_complete(manager.broadcast({
+                "type": "new_message",
+                "wa_id": wa_id,
+                "message": {
+                    "id": str(ai_msg.id),
+                    "text": ack_text,
+                    "sender": "agent",
+                    "timestamp": ai_msg.created_at.isoformat() if ai_msg.created_at else datetime.now().isoformat()
+                }
+            }))
+        
+        return "Success"
+    except Exception as e:
+        logger.error(f"Failed to send link click acknowledgment: {str(e)}")
+        return str(e)
+    finally:
+        db.close()

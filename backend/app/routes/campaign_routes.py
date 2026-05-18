@@ -574,3 +574,100 @@ def delete_campaign(
     )
 
     return {"message": "Campaign deleted"}
+
+
+class TrackedLinkCreate(BaseModel):
+    short_code: str
+    destination_url: str
+    campaign_id: str
+
+@router.post("/track-link", summary="Register a tracked link shortcode")
+def register_tracked_link(
+    data: TrackedLinkCreate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(any_agent)
+):
+    try:
+        from app.core.celery_app import celery_app
+        import json
+        redis_client = celery_app.backend.client
+        redis_client.set(
+            f"shortcode:{data.short_code}",
+            json.dumps({
+                "destination_url": data.destination_url,
+                "campaign_id": data.campaign_id
+            })
+        )
+        return {"status": "success", "message": f"Shortcode '{data.short_code}' registered successfully!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/r/{short_code}", summary="Redirect tracked link click and send AI acknowledgment")
+async def redirect_tracked_link(
+    short_code: str,
+    to: Optional[str] = None,
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    try:
+        from app.core.celery_app import celery_app
+        import json
+        from fastapi.responses import RedirectResponse
+        
+        redis_client = celery_app.backend.client
+        data_str = redis_client.get(f"shortcode:{short_code}")
+        if not data_str:
+            logger.warning(f"Link Redirect: Shortcode '{short_code}' not found in Redis.")
+            return RedirectResponse(url="/")
+            
+        data = json.loads(data_str)
+        campaign_id = data.get("campaign_id")
+        destination_url = data.get("destination_url")
+        
+        if to:
+            wa_id = to.strip().replace("+", "")
+            logger.info(f"Link Redirect: Click detected from {wa_id} for campaign {campaign_id}")
+            
+            # 1. Update message status to 'read' if it exists
+            from app.models.whatsapp_chat_model import WhatsAppMessage
+            msg = db.query(WhatsAppMessage).filter(
+                WhatsAppMessage.wa_id == wa_id,
+                WhatsAppMessage.campaign_id == campaign_id
+            ).order_by(WhatsAppMessage.created_at.desc()).first()
+            
+            if msg:
+                if msg.delivery_status != 'read':
+                    msg.delivery_status = 'read'
+                    db.commit()
+                    
+                    # Broadcast status update
+                    from app.core.websocket_manager import manager
+                    await manager.broadcast({
+                        "type": "status_update",
+                        "meta_id": msg.meta_message_id,
+                        "status": "read",
+                        "wa_id": wa_id,
+                        "campaign_id": str(campaign_id)
+                    })
+            
+            # 2. Trigger Celery task for AI acknowledgment
+            from app.workers.campaign_worker import send_link_click_acknowledgment
+            send_link_click_acknowledgment.delay(wa_id, destination_url, str(campaign_id))
+            
+            # 3. Log Action
+            from app.models.campaign import Campaign
+            campaign = db.query(Campaign).get(campaign_id)
+            org_id = campaign.organization_id if campaign else None
+            
+            log_action(
+                db, "LINK_CLICKED", "CAMPAIGNS",
+                organization_id=org_id,
+                details={"campaign_id": str(campaign_id), "wa_id": wa_id, "destination_url": destination_url, "short_code": short_code},
+                request=request
+            )
+            
+        return RedirectResponse(url=destination_url)
+    except Exception as e:
+        logger.error(f"Link Redirect Error: {str(e)}")
+        return RedirectResponse(url="/")
