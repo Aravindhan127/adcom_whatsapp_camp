@@ -603,11 +603,11 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
     setRetryingCooldown(true);
     try {
       await whatsappApi.retryCooldown(campaign.id);
-      toast.show("Success", "Cooldown retry queued in background! Messages will be resent once health check passes.", "success");
+      toast.success("Success", "Cooldown retry queued in background! Messages will be resent once health check passes.");
       fetchLogs();
     } catch (err) {
       console.error("Retry cooldown failed:", err);
-      toast.show("Error", "Failed to queue cooldown retry.", "error");
+      toast.error("Error", "Failed to queue cooldown retry.");
     } finally {
       setRetryingCooldown(false);
     }
