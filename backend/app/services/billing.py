@@ -24,7 +24,8 @@ def ensure_conversation(db: Session, wa_id: str, category: str, organization_id:
         active_query = db.query(WhatsAppConversation).filter(
             WhatsAppConversation.wa_id.ilike(f"%{wa_id_clean}%"),
             WhatsAppConversation.category == category,
-            WhatsAppConversation.started_at >= twenty_four_hours_ago
+            WhatsAppConversation.is_active == True,
+            WhatsAppConversation.window_expires_at >= twenty_four_hours_ago
         )
         if organization_id:
             active_query = active_query.filter(WhatsAppConversation.organization_id == organization_id)
@@ -47,7 +48,8 @@ def ensure_conversation(db: Session, wa_id: str, category: str, organization_id:
             first_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             service_count = db.query(WhatsAppConversation).filter(
                 WhatsAppConversation.category == "service",
-                WhatsAppConversation.started_at >= first_of_month
+                WhatsAppConversation.started_at >= first_of_month,
+                WhatsAppConversation.is_active == True
             ).count()
             
             if service_count < 1000:
@@ -86,15 +88,11 @@ def ensure_conversation(db: Session, wa_id: str, category: str, organization_id:
             rate_inr=cost_inr,
             exchange_rate=exchange_rate,
             started_at=started_at,
-            window_expires_at=started_at + timedelta(hours=24), # Set the 24h window
-            billing_status="charged",
+            window_expires_at=None, # Set to None initially until successfully delivered
+            billing_status="pending", # Pending until delivered
+            is_active=False, # Inactive initially
             meta_message_id=meta_message_id
         )
-        
-        # Deduct from System Balance (Rule 3)
-        if cost_inr > 0:
-            settings.meta_balance_inr = round((settings.meta_balance_inr or 0) - cost_inr, 4)
-            settings.meta_balance_usd = round((settings.meta_balance_usd or 0) - cost_usd, 4)
         
         db.add(new_conv)
         if commit:
