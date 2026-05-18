@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
@@ -10,10 +11,12 @@ from app.models.whatsapp_conversation import WhatsAppConversation
 
 from app.services.billing import ensure_conversation
 from app.models.settings import SystemSettings
+from app.models.organization import OrganizationConfig
 
 from app.services.meta_api import (
     send_whatsapp_message as meta_send_msg, 
-    upload_media
+    upload_media,
+    format_meta_error
 )
 
 from app.core.config import settings
@@ -39,6 +42,7 @@ def finalize_billing_on_delivery(db: Session, meta_id: str, status: str):
 def send_whatsapp_message(
     db: Session,
     to: str,
+    organization_id: uuid.UUID,
     text: Optional[str] = None,
     media_path: Optional[str] = None,
     media_type: str = "text"
@@ -46,18 +50,35 @@ def send_whatsapp_message(
     """
     Sends a live chat message (text or media) and tracks billing.
     """
+    # 1. Fetch Organization Credentials
+    config = db.query(OrganizationConfig).filter(OrganizationConfig.organization_id == organization_id).first()
+    if not config or not config.access_token:
+        # Fallback to system settings if allowed, or error out
+        settings = SystemSettings.get_settings(db)
+        if not settings.whatsapp_token:
+             return {"error": "Organization has no Meta Access Token configured"}
+        token = settings.whatsapp_token
+        phone_id = settings.phone_number_id
+    else:
+        token = config.access_token
+        phone_id = config.phone_number_id
+
+    # 2. Upload Media if needed
     media_id = None
     if media_path and os.path.exists(media_path):
-        upload_res = upload_media(media_path, media_type)
+        upload_res = upload_media(file_path=media_path, media_type=media_type, token=token, phone_id=phone_id)
         if "id" in upload_res:
             media_id = upload_res["id"]
         else:
             return {"error": f"Media upload failed: {upload_res.get('error')}"}
 
-    # Track Billing (Service Category for Live Chat replies)
-    billing_res = ensure_conversation(db, to, "service")
+    # 3. Track Billing (Service Category for Live Chat replies)
+    billing_res = ensure_conversation(db, to, "service", organization_id=organization_id)
 
+    # 4. Call Meta API with organization credentials
     response_json = meta_send_msg(
+        token=token,
+        phone_id=phone_id,
         to=to,
         text=text,
         media_id=media_id,
@@ -66,7 +87,7 @@ def send_whatsapp_message(
 
     # Handle Meta API errors
     if "error" in response_json:
-        error_msg = response_json.get("error", "Unknown error from Meta API")
+        error_msg = format_meta_error(response_json)
         return {"error": error_msg}
 
     if "messages" in response_json:

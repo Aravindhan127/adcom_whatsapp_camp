@@ -14,7 +14,7 @@ logger = logging.getLogger("adcom-api")
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.agent import Agent
-from app.core.security import get_current_user, get_current_user_flexible, RoleChecker
+from app.core.security import get_current_user, get_current_user_flexible, RoleChecker, user_has_bypass
 from app.services.whatsapp_chat_service import finalize_billing_on_delivery, send_whatsapp_message, verify_whatsapp_token
 from app.services.billing import ensure_conversation
 from app.services.ai_brain import chat_with_knowledge
@@ -46,113 +46,13 @@ async def whatsapp_verify(
     return verify_whatsapp_token(hub_mode, hub_verify_token, hub_challenge)
 
 
-@router.post("/webhook")
-async def receive_whatsapp(request: Request, db: Session = Depends(get_db)):
-    # SECURITY: Validate content type and parse JSON safely
-    content_type = request.headers.get("content-type", "")
-    if "application/json" not in content_type:
-        logger.warning(f"Webhook received invalid content-type: {content_type}")
-        raise HTTPException(status_code=400, detail="Invalid content type")
-
-    try:
-        data = await request.json()
-    except json.JSONDecodeError as e:
-        logger.error(f"Webhook received invalid JSON: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    except Exception as e:
-        logger.error(f"Webhook parsing error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Failed to parse request")
-    
-    if "entry" not in data or not data["entry"]:
-        return {"status": "no entry"}
-        
-    entry = data["entry"][0]
-    changes = entry.get("changes", [])[0]
-    value = changes.get("value", {})
-
-    # Handle Status Updates (Delivery Tracking - Rule 8)
-    statuses = value.get("statuses")
-    if statuses:
-        for update in statuses:
-            meta_id = update.get("id")
-            new_status = update.get("status")
-            msg = finalize_billing_on_delivery(db, meta_id, new_status)
-            if msg:
-                await manager.broadcast({
-                    "type": "status_update",
-                    "meta_id": meta_id,
-                    "status": new_status,
-                    "wa_id": msg.wa_id
-                })
-        return {"status": "delivery_updates_processed"}
-
-    messages = value.get("messages")
-    if not messages:
-        return {"status": "no messages"}
-        
-    msg = messages[0]
-    wa_id = normalize_wa_id(msg["from"])
-    meta_message_id = msg.get("id")
-    msg_type = msg.get("type", "text")
-    
-    user_text = ""
-    if msg_type == "text":
-        user_text = msg["text"]["body"].strip()
-    elif msg_type == "button":
-        user_text = msg["button"]["text"]
-    elif msg_type == "interactive":
-        interactive = msg.get("interactive", {})
-        itype = interactive.get("type")
-        if itype == "button_reply":
-            user_text = interactive["button_reply"]["title"]
-    
-    # 1. Start/Resume Billing Window (Rule 1)
-    billing = ensure_conversation(db, wa_id, "service", meta_message_id=meta_message_id)
-    conv = billing.get("conversation")
-    conversation_id = conv.id if conv else None
-    
-    # Refresh the 24h window (Every user message starts a new 24h service window)
-    if conv:
-        conv.window_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-        db.commit()
-    
-    # 2. Save incoming message (Rule 5)
-    existing_msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.meta_message_id == meta_message_id).first()
-    if existing_msg:
-        logger.info(f"Ignoring duplicate WhatsApp message: {meta_message_id}")
-        return {"status": "already_processed", "meta_message_id": meta_message_id}
-
-    incoming = WhatsAppMessage(
-        wa_id=wa_id, direction="in", message=user_text,
-        meta_message_id=meta_message_id, conversation_id=conversation_id, message_type=msg_type
-    )
-    db.add(incoming)
-    db.commit()
-    db.refresh(incoming)
-
-    # Look up contact name strictly from the Contact Table
-    # Smart Match: Use last 10 digits to resolve country code mismatches
-    last_10 = wa_id[-10:] if len(wa_id) >= 10 else wa_id
-    contact = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}")).first()
-    contact_name = contact.name if (contact and contact.name) else None
-
-    # 3. Notify real-time (Rule: Live Chat updates)
-    await manager.notify_new_message(wa_id, {
-        "id": str(incoming.id),
-        "text": user_text,
-        "timestamp": incoming.created_at.isoformat() if incoming.created_at else datetime.now().isoformat(),
-        "sender": "user",
-        "contactName": contact_name
-    })
-
-    # 3. Handle Automated Brochure Request (Latest featuredev branch logic)
-    if handle_brochure_request(db, wa_id, user_text):
-        return {"status": "brochure_sent"}
-    
-    # 4. Automated Responses Disabled (Rule: User requested removal of LLM messages)
-    # The AI Knowledge Assistant block has been removed.
-    
-    return {"status": "message_received", "conversation_id": conversation_id}
+@router.post("/webhook", include_in_schema=False)
+async def receive_whatsapp_deprecated(request: Request, db: Session = Depends(get_db)):
+    """
+    DEPRECATED: Use /api/webhook/ instead for better analytics and AI support.
+    """
+    logger.warning("Redundant Webhook Hit: /api/whatsapp/webhook is deprecated. Switch to /api/webhook/")
+    return {"status": "deprecated", "message": "Please use /api/webhook/"}
 ...
 @router.get("/conversations", summary="List All Conversations")
 def list_conversations(
@@ -170,6 +70,10 @@ def list_conversations(
     )
     
     query = db.query(WhatsAppConversation).filter(WhatsAppConversation.id.in_(latest_conv_ids_subquery))
+    
+    # Isolation: Filter by organization unless superadmin
+    if not user_has_bypass(current_user):
+        query = query.filter(WhatsAppConversation.organization_id == current_user.organization_id)
     
     if search:
         query = query.filter(WhatsAppConversation.wa_id.ilike(f"%{search}%"))
@@ -192,9 +96,12 @@ def list_conversations(
     for conv in items:
         last_msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.conversation_id == conv.id).order_by(WhatsAppMessage.created_at.desc()).first()
         
-        # Look up contact name
+        # Look up contact name (scoped to org)
         last_10 = conv.wa_id[-10:] if len(conv.wa_id) >= 10 else conv.wa_id
-        contact = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}")).first()
+        contact_query = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}"))
+        if not user_has_bypass(current_user):
+            contact_query = contact_query.filter(Contact.organization_id == current_user.organization_id)
+        contact = contact_query.first()
         contact_name = contact.name if contact else None
 
         # Determine if the 24h window is still active
@@ -255,7 +162,7 @@ async def send_message_route(
     if not to or not text:
         raise HTTPException(status_code=400, detail="Missing 'to' or 'message'")
 
-    res = send_whatsapp_message(db=db, to=to, text=text)
+    res = send_whatsapp_message(db=db, to=to, organization_id=current_user.organization_id, text=text)
     if "error" in res:
         raise HTTPException(status_code=400, detail=res.get("error", "Failed to send message"))
     return res
@@ -323,7 +230,7 @@ async def send_media_route(
         if not file_path.exists() or file_path.stat().st_size == 0:
             raise HTTPException(status_code=400, detail="Invalid or empty file")
 
-        res = send_whatsapp_message(db=db, to=to, media_path=str(file_path), media_type=media_type)
+        res = send_whatsapp_message(db=db, to=to, organization_id=current_user.organization_id, media_path=str(file_path), media_type=media_type)
 
         # Check for Meta API errors
         if "error" in res:
@@ -349,8 +256,22 @@ async def get_media_proxy(
     current_user: Agent = Depends(get_current_user_flexible)
 ):
     """Proxy route to fetch media from Meta and serve it to the frontend."""
+    # 0. Fetch Organization Credentials (Scoped to current user)
+    from app.models.organization import OrganizationConfig
+    config = db.query(OrganizationConfig).filter(OrganizationConfig.organization_id == current_user.organization_id).first()
+    if not config or not config.access_token:
+        # Fallback to system settings
+        from app.models.settings import SystemSettings
+        settings = SystemSettings.get_settings(db)
+        token = settings.whatsapp_token
+    else:
+        token = config.access_token
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Meta Access Token is not configured")
+
     # 1. Get download URL from Meta
-    meta_data = get_meta_media_url(media_id)
+    meta_data = get_meta_media_url(media_id, token=token)
     download_url = meta_data.get("url")
     
     if not download_url:
@@ -358,7 +279,7 @@ async def get_media_proxy(
         raise HTTPException(status_code=404, detail="Media not found on Meta")
         
     # 2. Get binary content
-    content, mime_type = get_meta_media_content(download_url)
+    content, mime_type = get_meta_media_content(download_url, token=token)
     
     if not content:
         raise HTTPException(status_code=404, detail="Failed to download media content")

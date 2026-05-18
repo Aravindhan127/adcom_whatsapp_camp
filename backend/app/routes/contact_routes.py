@@ -9,15 +9,20 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Q
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
-from app.core.database import get_db
+from app.core.database import get_db, logger
 from app.models.contact import Contact, ContactList, ImportHistory, ContactStatus, ContactSource, ImportStatus
-from app.core.security import get_current_user, RoleChecker
+from app.models.organization import ContactFieldConfig
+from app.core.security import get_current_user, RoleChecker, verify_org_access, PermissionChecker, user_has_bypass
 from app.models.agent import Agent
 from app.services.audit_service import log_action
 from fastapi import Request
 
 # Access control workers
-admin_only = RoleChecker(["admin"])
+require_view = PermissionChecker("contact.view")
+require_manage = PermissionChecker("contact.manage")
+require_import = PermissionChecker("contact.import")
+require_delete = PermissionChecker("contact.delete")
+admin_only = PermissionChecker("org.manage")
 any_agent = get_current_user
 
 # Pre-defined list of common date formats for robust parsing
@@ -59,6 +64,13 @@ def sanitize_excel_phone(val):
         except:
             pass
     return s_val
+    
+class FieldConfigCreate(BaseModel):
+    field_name: str
+    field_label: str
+    field_type: str = "text"
+    is_required: bool = False
+    options: Optional[List[str]] = None
 
 router = APIRouter(prefix="/contacts", tags=["Contacts Management"])
 
@@ -112,9 +124,19 @@ async def bulk_import_contacts(
     list_id: Optional[uuid.UUID] = Form(None),
     field_mapping: Optional[str] = Form(None),
     upsert: bool = Form(False),
+    organization_id: Optional[uuid.UUID] = Form(None),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_import)
 ):
+    # Isolation Logic: Determine which org this import belongs to
+    target_org_id = organization_id or current_user.organization_id
+    if not target_org_id:
+        raise HTTPException(status_code=400, detail="Organization ID is required")
+
+    # SECURITY: Only Super Admin can specify an org different from their own
+    if organization_id and organization_id != current_user.organization_id:
+        if not user_has_bypass(current_user):
+            raise HTTPException(status_code=403, detail="Not authorized to import for other organizations")
     filename = file.filename.lower()
     if not (filename.endswith('.csv') or filename.endswith('.xlsx') or filename.endswith('.xls') or filename.endswith('.xlx')):
         raise HTTPException(400, "Only CSV and Excel (.xlsx, .xls, .xlx) supported")
@@ -127,7 +149,8 @@ async def bulk_import_contacts(
     
     import_record = ImportHistory(
         filename=file.filename, file_type=file_type,
-        uploaded_by=current_user.username, status=ImportStatus.PROCESSING.value
+        uploaded_by=current_user.username, status=ImportStatus.PROCESSING.value,
+        organization_id=target_org_id # Track which org imported this
     )
     db.add(import_record)
     db.commit()
@@ -184,9 +207,9 @@ async def bulk_import_contacts(
         existing_in_db_map = {}
         unique_incoming = list(set(incoming_numbers))
         if unique_incoming:
-            # For large batches, we might need a more optimized query, 
-            # but for stand-alone use cases, batch chunks of 100 is fine.
+            # Filter by organization to avoid leakage
             existing_contacts = db.query(Contact).filter(
+                Contact.organization_id == target_org_id,
                 or_(*[Contact.phone_number.like(f"%{num}") for num in unique_incoming[:100]])
             ).all()
             existing_in_db_map = {normalize_phone(c.phone_number): c for c in existing_contacts}
@@ -222,36 +245,6 @@ async def bulk_import_contacts(
                 continue
             seen_in_batch.add(norm)
 
-            if norm in existing_in_db_map:
-                if upsert:
-                    existing_contact = existing_in_db_map[norm]
-                    if name: existing_contact.name = name
-                    if list_id: existing_contact.list_id = list_id
-                    
-                    # Update new fields on upsert using mapping where possible
-                    def get_val(key, fallbacks):
-                        col = mapping.get(key)
-                        if col and col in row: return row[col]
-                        for f in fallbacks:
-                            if f in row: return row[f]
-                        return None
-
-                    existing_contact.company_name = get_val('company_name', ['company_name', 'company']) or existing_contact.company_name
-                    existing_contact.lead_source = get_val('lead_source', ['lead_source', 'source']) or existing_contact.lead_source
-                    dob_raw = get_val('date_of_birth', ['date_of_birth', 'dob'])
-                    if dob_raw:
-                        existing_contact.date_of_birth = parse_date(dob_raw)
-                    existing_contact.customer_category = get_val('customer_category', ['customer_category', 'type']) or existing_contact.customer_category
-                    existing_contact.customer_stage = get_val('customer_stage', ['customer_stage', 'stage']) or existing_contact.customer_stage
-                    existing_contact.city = get_val('city', ['city']) or existing_contact.city
-                    existing_contact.product_service_interest = get_val('product_service_interest', ['product_service_interest', 'interest']) or existing_contact.product_service_interest
-                    existing_contact.consent_confirmation = get_val('consent_confirmation', ['consent_confirmation', 'consent']) or existing_contact.consent_confirmation
-                    
-                    updated += 1
-                else:
-                    duplicate_details.append({"phone": cleaned, "name": name})
-                continue
-            
             # Utility to get value from row based on mapping or fallbacks
             def get_row_val(key, fallbacks):
                 col = mapping.get(key)
@@ -260,11 +253,56 @@ async def bulk_import_contacts(
                     if f in row: return row[f]
                 return None
 
+            # 4. Handle Custom Fields Mapping (Rule: Admin/SuperAdmin Configured)
+            # Identify which mapping keys are 'custom' (not in standard model fields)
+            standard_keys = ['phone_number', 'name', 'company_name', 'lead_source', 'date_of_birth', 'customer_category', 'customer_stage', 'city', 'product_service_interest', 'consent_confirmation']
+            
+            def get_custom_data(row_dict, mapping_dict):
+                data = {}
+                # Logic A: Explicitly mapped custom fields
+                for target_field, excel_col in mapping_dict.items():
+                    if target_field not in standard_keys and excel_col in row_dict:
+                        data[target_field] = row_dict[excel_col]
+                
+                # Logic B: Auto-detect (If not explicitly mapped, check for common names matching standard keys)
+                # This is already handled by Logic A if mapping is correct, but let's keep it robust.
+                return data
+
+            if norm in existing_in_db_map:
+                if upsert:
+                    existing_contact = existing_in_db_map[norm]
+                    if name: existing_contact.name = name
+                    if list_id: existing_contact.list_id = list_id
+                    
+                    existing_contact.company_name = get_row_val('company_name', ['company_name', 'company']) or existing_contact.company_name
+                    existing_contact.lead_source = get_row_val('lead_source', ['lead_source', 'source']) or existing_contact.lead_source
+                    dob_raw = get_row_val('date_of_birth', ['date_of_birth', 'dob'])
+                    if dob_raw:
+                        existing_contact.date_of_birth = parse_date(dob_raw)
+                    existing_contact.customer_category = get_row_val('customer_category', ['customer_category', 'type']) or existing_contact.customer_category
+                    existing_contact.customer_stage = get_row_val('customer_stage', ['customer_stage', 'stage']) or existing_contact.customer_stage
+                    existing_contact.city = get_row_val('city', ['city']) or existing_contact.city
+                    existing_contact.product_service_interest = get_row_val('product_service_interest', ['product_service_interest', 'interest']) or existing_contact.product_service_interest
+                    existing_contact.consent_confirmation = get_row_val('consent_confirmation', ['consent_confirmation', 'consent']) or existing_contact.consent_confirmation
+                    
+                    # Update Custom Fields on Upsert
+                    new_custom = get_custom_data(row, mapping)
+                    if new_custom:
+                        if not existing_contact.custom_fields:
+                            existing_contact.custom_fields = {}
+                        existing_contact.custom_fields.update(new_custom)
+                    
+                    updated += 1
+                else:
+                    duplicate_details.append({"phone": cleaned, "name": name})
+                continue
+
             contacts_to_create.append(Contact(
                 phone_number=cleaned, 
                 name=name, 
                 country_code=cc,
-                source=ContactSource.CSV.value, 
+                organization_id=target_org_id,
+                source=file_type, 
                 list_id=list_id,
                 import_id=import_record.id,
                 # Fields from mapping logic
@@ -275,7 +313,8 @@ async def bulk_import_contacts(
                 customer_stage=get_row_val('customer_stage', ['customer_stage', 'stage']),
                 city=get_row_val('city', ['city']),
                 product_service_interest=get_row_val('product_service_interest', ['product_service_interest', 'interest']),
-                consent_confirmation=get_row_val('consent_confirmation', ['consent_confirmation', 'consent'])
+                consent_confirmation=get_row_val('consent_confirmation', ['consent_confirmation', 'consent']),
+                custom_fields=get_custom_data(row, mapping) # Store mapped dynamic data
             ))
             success += 1
         
@@ -304,7 +343,8 @@ async def bulk_import_contacts(
         
         log_action(
             db, "BULK_IMPORT", "CONTACTS", 
-            user_id=str(current_user.id), username=current_user.username,
+            user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+            organization_id=target_org_id,
             details={"filename": file.filename, "success": success, "updated": updated, "total": len(rows)},
             request=request
         )
@@ -332,6 +372,7 @@ class ContactCreate(BaseModel):
     name: Optional[str] = None
     list_id: Optional[uuid.UUID] = None
     upsert: Optional[bool] = False
+    organization_id: Optional[uuid.UUID] = None
     
     # New Fields
     company_name: Optional[str] = None
@@ -342,21 +383,35 @@ class ContactCreate(BaseModel):
     city: Optional[str] = None
     product_service_interest: Optional[str] = None
     consent_confirmation: Optional[str] = None
+    
+    # Dynamic Data
+    custom_fields: Optional[dict] = None
 
 @router.post("/", summary="Create Single Contact")
 async def create_contact(
     contact: ContactCreate,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_manage)
 ):
     is_valid, cleaned, cc, err = validate_phone_number(contact.phone_number)
     if not is_valid:
         raise HTTPException(400, f"Invalid phone number: {err}")
     
     norm = normalize_phone(cleaned)
-    # Strict duplicate check using normalized number
+    # Isolation Logic: Determine which org this contact belongs to
+    target_org_id = contact.organization_id or current_user.organization_id
+    if not target_org_id:
+        raise HTTPException(status_code=400, detail="Organization ID is required. Please select one.")
+
+    # SECURITY: Only Super Admin can specify an org different from their own
+    if contact.organization_id and contact.organization_id != current_user.organization_id:
+        if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+            raise HTTPException(status_code=403, detail="Not authorized to create contacts for other organizations")
+
+    # Strict duplicate check using normalized number within the target org
     query = db.query(Contact).filter(
+        Contact.organization_id == target_org_id,
         or_(
             Contact.phone_number == cleaned,
             Contact.phone_number == norm,
@@ -380,18 +435,32 @@ async def create_contact(
             if contact.product_service_interest: existing.product_service_interest = contact.product_service_interest
             if contact.consent_confirmation: existing.consent_confirmation = contact.consent_confirmation
             
+            # Update Dynamic Fields (Merge existing with new)
+            if contact.custom_fields:
+                if not existing.custom_fields:
+                    existing.custom_fields = {}
+                existing.custom_fields.update(contact.custom_fields)
+            
             db.commit()
             db.refresh(existing)
             return existing
         else:
-            raise HTTPException(400, f"This number ({cleaned}) already exists. Do you want to update? If yes, choose to update. If not, do not update.")
-    
+            raise HTTPException(400, f"This number ({cleaned}) already exists in this organization.")
+
+    # Validate Required Dynamic Fields
+    custom_fields_data = contact.custom_fields or {}
+    field_configs = db.query(ContactFieldConfig).filter(ContactFieldConfig.organization_id == target_org_id).all()
+    for config in field_configs:
+        if config.is_required and not custom_fields_data.get(config.field_name):
+            raise HTTPException(status_code=400, detail=f"The field '{config.field_label}' is required for this organization.")
+
     new_contact = Contact(
         phone_number=cleaned,
         name=contact.name,
         country_code=cc,
         source=ContactSource.MANUAL.value,
         list_id=contact.list_id,
+        organization_id=target_org_id,
         # New Fields
         company_name=contact.company_name,
         lead_source=contact.lead_source,
@@ -400,7 +469,8 @@ async def create_contact(
         customer_stage=contact.customer_stage,
         city=contact.city,
         product_service_interest=contact.product_service_interest,
-        consent_confirmation=contact.consent_confirmation
+        consent_confirmation=contact.consent_confirmation,
+        custom_fields=contact.custom_fields
     )
     db.add(new_contact)
     db.commit()
@@ -408,7 +478,8 @@ async def create_contact(
 
     log_action(
         db, "CREATE_CONTACT", "CONTACTS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"phone": cleaned, "name": contact.name},
         request=request
     )
@@ -418,7 +489,7 @@ async def create_contact(
 @router.get("/filter-options", summary="Get Unique Values for Contact Filters")
 async def get_contact_filter_options(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     """Returns unique values for categories, stages, cities, and sources to populate UI filters."""
     categories = db.query(Contact.customer_category).filter(Contact.customer_category != None).distinct().all()
@@ -432,6 +503,54 @@ async def get_contact_filter_options(
         "cities": [ct[0] for ct in cities],
         "sources": [src[0] for src in sources]
     }
+
+@router.get("/config/fields", summary="Get Organization Custom Fields")
+async def get_org_field_config(
+    org_id: Optional[uuid.UUID] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(require_view)
+):
+    target_org_id = org_id or current_user.organization_id
+    if not target_org_id:
+        return []
+    
+    # SECURITY: Verify access if fetching for another org
+    if org_id and org_id != current_user.organization_id:
+        if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+            raise HTTPException(status_code=403, detail="Not authorized to view other organization fields")
+            
+    fields = db.query(ContactFieldConfig).filter(ContactFieldConfig.organization_id == target_org_id).all()
+    return fields
+
+@router.post("/config/fields", summary="Add Organization Custom Field")
+async def add_org_field_config(
+    field_in: FieldConfigCreate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(PermissionChecker("system.manage")) # Restricted to System/Super Admin
+):
+    # Rule: Field names should be alphanumeric and lowercase for JSON consistency
+    safe_name = re.sub(r'[^a-z0-9_]', '', field_in.field_name.lower())
+    
+    existing = db.query(ContactFieldConfig).filter(
+        ContactFieldConfig.organization_id == current_user.organization_id,
+        ContactFieldConfig.field_name == safe_name
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="A field with this name already exists")
+        
+    new_field = ContactFieldConfig(
+        organization_id=current_user.organization_id,
+        field_name=safe_name,
+        field_label=field_in.field_label,
+        field_type=field_in.field_type,
+        is_required=field_in.is_required,
+        options=field_in.options
+    )
+    db.add(new_field)
+    db.commit()
+    db.refresh(new_field)
+    return new_field
 
 @router.get("/", summary="List Contacts with Filters")
 async def list_contacts(
@@ -448,17 +567,26 @@ async def list_contacts(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     try:
         query = db.query(Contact)
         
+        # Isolation: Filter by organization unless superadmin
+        if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+            query = query.filter(Contact.organization_id == current_user.organization_id)
+        
         # 1. Search (Name/Phone)
+        # 1. Search Logic
+        print(f"DEBUG: Fetching contacts | search: {search} | stage: {customer_stage} | category: {customer_category}")
         if search:
+            search_term = f"%{search}%"
             query = query.filter(
                 or_(
-                    Contact.name.ilike(f"%{search}%"),
-                    Contact.phone_number.ilike(f"%{search}%")
+                    Contact.name.ilike(search_term),
+                    Contact.phone_number.ilike(search_term),
+                    Contact.company_name.ilike(search_term),
+                    Contact.city.ilike(search_term)
                 )
             )
         
@@ -470,7 +598,7 @@ async def list_contacts(
         if company_name:
             query = query.filter(Contact.company_name.ilike(f"%{company_name}%"))
         if lead_source:
-            query = query.filter(Contact.lead_source.ilike(f"%{lead_source}%"))
+            query = query.filter(Contact.lead_source == lead_source)
         if customer_category:
             query = query.filter(Contact.customer_category == customer_category)
         if customer_stage:
@@ -480,6 +608,7 @@ async def list_contacts(
         
         # 3. Total Count (before pagination)
         total = query.count()
+        print(f"DEBUG: Found {total} total contacts matching criteria")
         
         # 4. Sorting
         valid_columns = {
@@ -527,9 +656,13 @@ async def bulk_contact_action(
     request_payload: BulkActionRequest,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(admin_only)
+    current_user: Agent = Depends(require_delete)
 ):
-    query = db.query(Contact).filter(Contact.id.in_(request.contact_ids))
+    query = db.query(Contact).filter(Contact.id.in_(request_payload.contact_ids))
+    
+    # Isolation: Apply organization filter
+    if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+        query = query.filter(Contact.organization_id == current_user.organization_id)
     
     if request_payload.action == "delete":
         count = query.delete(synchronize_session=False)
@@ -537,7 +670,8 @@ async def bulk_contact_action(
 
         log_action(
             db, "BULK_DELETE_CONTACTS", "CONTACTS", 
-            user_id=str(current_user.id), username=current_user.username,
+            user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+            organization_id=current_user.organization_id,
             details={"count": count},
             request=request
         )
@@ -577,13 +711,20 @@ class ContactUpdate(BaseModel):
     city: Optional[str] = None
     product_service_interest: Optional[str] = None
     consent_confirmation: Optional[str] = None
+    
+    # Dynamic Data
+    custom_fields: Optional[dict] = None
 
 @router.get("/lists", summary="List All Contact Lists")
 async def list_contact_lists(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
-    lists = db.query(ContactList).order_by(ContactList.created_at.desc()).all()
+    query = db.query(ContactList)
+    if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+        query = query.filter(ContactList.organization_id == current_user.organization_id)
+        
+    lists = query.order_by(ContactList.created_at.desc()).all()
     result = []
     for cl in lists:
         count = db.query(Contact).filter(Contact.list_id == cl.id).count()
@@ -602,12 +743,15 @@ async def create_contact_list(
     name: str = Body(...),
     description: str = Body(None),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_manage)
 ):
-    existing = db.query(ContactList).filter(ContactList.name == name).first()
+    existing = db.query(ContactList).filter(
+        ContactList.name == name,
+        ContactList.organization_id == current_user.organization_id
+    ).first()
     if existing:
         raise HTTPException(status_code=400, detail="A list with this name already exists")
-    new_list = ContactList(name=name, description=description)
+    new_list = ContactList(name=name, description=description, organization_id=current_user.organization_id)
     db.add(new_list)
     db.commit()
     db.refresh(new_list)
@@ -623,7 +767,7 @@ class ListFromSelectionRequest(BaseModel):
 async def create_list_from_selection(
     request: ListFromSelectionRequest,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_manage)
 ):
     if not request.contact_ids:
         raise HTTPException(status_code=400, detail="No contacts selected")
@@ -634,36 +778,48 @@ async def create_list_from_selection(
     db.add(new_list)
     db.commit()
     db.refresh(new_list)
-    db.query(Contact).filter(Contact.id.in_(request.contact_ids)).update(
+    query = db.query(Contact).filter(Contact.id.in_(request.contact_ids))
+    
+    # Isolation: Verify ownership
+    if not (current_user.role_obj.can_bypass_isolation if current_user.role_obj else current_user.role == "superadmin"):
+        query = query.filter(Contact.organization_id == current_user.organization_id)
+        
+    updated_count = query.update(
         {"list_id": new_list.id}, synchronize_session=False
     )
     db.commit()
-    return {"id": str(new_list.id), "name": new_list.name, "count": len(request.contact_ids)}
+    return {"id": str(new_list.id), "name": new_list.name, "count": updated_count}
 
 
 @router.get("/{contact_id}", summary="Get a Single Contact by ID")
 def get_contact(
     contact_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     contact = db.query(Contact).filter(Contact.id == contact_id).first()
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
+        
+    # Isolation check
+    verify_org_access(current_user, contact.organization_id)
+        
     return contact
 
 @router.patch("/{contact_id}", summary="Update a Single Contact")
-
 async def update_contact(
     contact_id: uuid.UUID,
     contact_in: ContactUpdate,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_manage)
 ):
     contact = db.query(Contact).filter(Contact.id == contact_id).first()
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
+        
+    # Isolation check
+    verify_org_access(current_user, contact.organization_id)
 
     update_data = contact_in.dict(exclude_unset=True)
 
@@ -696,6 +852,11 @@ async def update_contact(
     for field, value in update_data.items():
         if field == 'date_of_birth' and value:
             setattr(contact, field, parse_date(value))
+        elif field == 'custom_fields' and value:
+            # Merge custom fields instead of simple overwrite
+            if not contact.custom_fields:
+                contact.custom_fields = {}
+            contact.custom_fields.update(value)
         else:
             setattr(contact, field, value)
 
@@ -704,7 +865,8 @@ async def update_contact(
 
     log_action(
         db, "UPDATE_CONTACT", "CONTACTS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"phone": contact.phone_number, "name": contact.name},
         request=request
     )
@@ -721,10 +883,13 @@ async def delete_contact(
     contact = db.query(Contact).filter(Contact.id == contact_id).first()
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
+        
+    # Isolation check
+    verify_org_access(current_user, contact.organization_id)
     
     log_action(
         db, "DELETE_CONTACT", "CONTACTS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
         details={"phone": contact.phone_number, "name": contact.name},
         request=request
     )

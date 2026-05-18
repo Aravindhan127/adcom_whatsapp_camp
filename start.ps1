@@ -122,7 +122,7 @@ if ($SSLAvailable) {
     $backendProto = "https"
 } else {
     $backendPort = 8000
-    $portInUse = Get-NetTCPConnection -LocalPort $backendPort -ErrorAction SilentlyContinue
+    $portInUse = Get-NetTCPConnection -LocalPort $backendPort -State Listen -ErrorAction SilentlyContinue
     if ($portInUse) {
         Write-Host "      Port $backendPort is already in use; falling back to port 8001." -ForegroundColor Yellow
         $backendPort = 8001

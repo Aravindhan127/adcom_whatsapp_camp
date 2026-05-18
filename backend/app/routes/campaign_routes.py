@@ -2,6 +2,7 @@ import uuid
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db, logger
@@ -13,17 +14,22 @@ from app.models.campaign import Campaign
 from app.models.contact import ContactList
 from app.models.settings import SystemSettings
 from app.services.campaign_service import start_campaign_run, pause_campaign, resume_campaign
-from app.services.analytics_service import get_campaign_analytics, get_campaign_detailed_logs
+from app.services.analytics_service import get_campaign_analytics, get_campaign_detailed_logs, export_campaign_logs_to_excel
 from app.services.meta_api import upload_media
-from app.core.security import get_current_user, RoleChecker
+from app.core.security import get_current_user, RoleChecker, verify_org_access, PermissionChecker, user_has_bypass
 from app.models.agent import Agent
 from app.models.contact import Contact, ContactList
 from app.models.template import WhatsAppTemplate
+from app.models.organization import OrganizationConfig
 from app.services.audit_service import log_action
 from fastapi import Request
 
 # Access control workers
-admin_only = RoleChecker(["admin"])
+require_view = PermissionChecker("campaign.view")
+require_create = PermissionChecker("campaign.create")
+require_manage = PermissionChecker("campaign.start") # 'start' serves as 'manage' for now
+require_delete = PermissionChecker("campaign.delete")
+admin_only = PermissionChecker("org.manage")
 any_agent = get_current_user
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
@@ -31,6 +37,7 @@ router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 @router.post("/upload-media", summary="Upload Campaign Media to Meta")
 async def upload_campaign_media(
     file: UploadFile = File(...),
+    db: Session = Depends(get_db),
     current_user: Agent = Depends(any_agent)
 ):
     """
@@ -44,6 +51,14 @@ async def upload_campaign_media(
             with open(fd, 'wb') as f:
                 f.write(content)
             
+            # Fetch Org Config for credentials
+            config = db.query(OrganizationConfig).filter(OrganizationConfig.organization_id == current_user.organization_id).first()
+            token = config.access_token if config else None
+            phone_id = config.phone_number_id if config else None
+
+            if not token or not phone_id:
+                raise HTTPException(status_code=400, detail="Organization Meta credentials not configured")
+
             # Send file to Meta API
             # Sanitize content_type (e.g., 'video/mp4' -> 'video')
             m_type = "image"
@@ -52,7 +67,7 @@ async def upload_campaign_media(
                 elif "audio" in file.content_type: m_type = "audio"
                 elif "pdf" in file.content_type or "document" in file.content_type: m_type = "document"
 
-            res = upload_media(temp_path, m_type)
+            res = upload_media(temp_path, m_type, token=token, phone_id=phone_id)
             if "error" in res:
                 raise HTTPException(status_code=400, detail=res["error"])
             
@@ -103,7 +118,7 @@ def create_campaign(
     payload: CampaignCreate, 
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_create)
 ):
     final_list_id = payload.contact_list_id
 
@@ -111,6 +126,7 @@ def create_campaign(
     if payload.contact_ids:
         new_list = ContactList(
             name=f"List for {payload.name} ({datetime.now().strftime('%H%M%S')})",
+            organization_id=current_user.organization_id,
             description=f"Auto-generated for campaign {payload.name}"
         )
         db.add(new_list)
@@ -152,6 +168,7 @@ def create_campaign(
         name=payload.name,
         template_name=payload.template_name,
         contact_list_id=final_list_id,
+        organization_id=current_user.organization_id, # Link to current user's organization
         status="draft",
         media_url=media_url,
         template_params=template_params,
@@ -164,7 +181,8 @@ def create_campaign(
 
     log_action(
         db, "CREATE_CAMPAIGN", "CAMPAIGNS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"campaign_id": str(new_campaign.id), "name": new_campaign.name},
         request=request
     )
@@ -181,9 +199,14 @@ def list_campaigns(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     query = db.query(Campaign).filter(Campaign.is_deleted == False)
+    
+    # Isolation: Filter by organization unless superadmin
+    if not user_has_bypass(current_user):
+        query = query.filter(Campaign.organization_id == current_user.organization_id)
+        
     if search:
         query = query.filter(Campaign.name.ilike(f"%{search}%"))
     if status:
@@ -235,11 +258,16 @@ def list_campaigns(
 def get_campaign(
     campaign_id: uuid.UUID, 
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
-    campaign = db.query(Campaign).get(campaign_id)
+    campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+    
     if not campaign or campaign.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+        
     return campaign
 
 
@@ -248,12 +276,35 @@ def start_campaign(
     campaign_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_user)
+    current_user: Agent = Depends(require_manage)
 ):
     logger.info(f"Campaign start requested by user: {current_user.username}")
     campaign = db.query(Campaign).get(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+
+    # Auto-fix: if campaign is stuck in 'running' with 0 sent, reset it so it can be restarted
+    if campaign.status == "running":
+        from app.models.campaign_run import CampaignRun
+        from app.services.analytics_service import get_campaign_analytics
+        analytics = get_campaign_analytics(db, str(campaign_id))
+        sent = analytics.get("total_sent", 0)
+        if sent == 0:
+            logger.warning(f"Campaign {campaign_id} is stuck in 'running' with 0 sent. Auto-resetting to draft.")
+            zombie_runs = db.query(CampaignRun).filter(
+                CampaignRun.campaign_id == campaign_id,
+                CampaignRun.status.in_(["running", "paused"])
+            ).all()
+            for r in zombie_runs:
+                db.delete(r)
+            campaign.status = "draft"
+            campaign.total_contacts = 0
+            db.commit()
+        else:
+            raise HTTPException(status_code=400, detail="Campaign is already running.")
 
     if campaign.status not in ("draft", "scheduled", "on_hold"):
         raise HTTPException(status_code=400, detail=f"Cannot start campaign with status '{campaign.status}'")
@@ -265,7 +316,8 @@ def start_campaign(
 
     log_action(
         db, "START_CAMPAIGN", "CAMPAIGNS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"campaign_id": str(campaign_id), "name": campaign.name},
         request=request
     )
@@ -278,15 +330,23 @@ def pause_campaign_route(
     campaign_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_user)
+    current_user: Agent = Depends(require_manage)
 ):
+    campaign = db.query(Campaign).get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+
     result = pause_campaign(db, campaign_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     
     log_action(
         db, "PAUSE_CAMPAIGN", "CAMPAIGNS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"campaign_id": str(campaign_id)},
         request=request
     )
@@ -298,26 +358,62 @@ def resume_campaign_route(
     campaign_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_user)
+    current_user: Agent = Depends(require_manage)
 ):
+    campaign = db.query(Campaign).get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+
     result = resume_campaign(db, campaign_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     
     log_action(
         db, "RESUME_CAMPAIGN", "CAMPAIGNS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"campaign_id": str(campaign_id)},
         request=request
     )
     return result
 
 
+@router.post("/{campaign_id}/retry-cooldown", summary="Retry all cooldown messages for a campaign")
+def retry_campaign_cooldown_route(
+    campaign_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(require_manage)
+):
+    campaign = db.query(Campaign).get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+
+    # Trigger Celery background task
+    from app.workers.campaign_worker import retry_campaign_cooldown
+    retry_campaign_cooldown.delay(str(campaign_id))
+    
+    log_action(
+        db, "RETRY_COOLDOWN_CAMPAIGN", "CAMPAIGNS", 
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
+        details={"campaign_id": str(campaign_id)},
+        request=request
+    )
+    return {"status": "success", "message": "Cooldown retry queued in background."}
+
+
 @router.get("/{campaign_id}/stats", summary="Get Campaign Analytics")
 def get_campaign_stats(
     campaign_id: uuid.UUID, 
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     campaign = db.query(Campaign).get(campaign_id)
     if not campaign:
@@ -340,13 +436,42 @@ def get_campaign_logs_route(
     campaign_id: uuid.UUID,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
+    status: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     """
     Returns a list of all recipients and their current message status for this campaign.
+    Supports status filtering.
     """
-    return get_campaign_detailed_logs(db, str(campaign_id), skip=skip, limit=limit)
+    return get_campaign_detailed_logs(db, str(campaign_id), skip=skip, limit=limit, status=status)
+
+
+@router.get("/{campaign_id}/export", summary="Export Campaign Logs to Excel")
+def export_campaign_logs_route(
+    campaign_id: uuid.UUID,
+    status: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(require_view)
+):
+    """
+    Generates an Excel file of the recipient logs, filtered by status if provided.
+    """
+    # Isolation check
+    campaign = db.query(Campaign).get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    verify_org_access(current_user, campaign.organization_id)
+
+    excel_data = export_campaign_logs_to_excel(db, str(campaign_id), status=status)
+    
+    filename = f"campaign_logs_{campaign.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    return StreamingResponse(
+        excel_data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 # BE-FIX BE-15: These specific routes MUST come BEFORE /{campaign_id} to avoid
@@ -355,14 +480,19 @@ def get_campaign_logs_route(
 @router.get("/active/progress", summary="Get Live Progress of Running Campaigns")
 def get_active_campaigns_progress(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_view)
 ):
     """
     Get progress of all currently running campaigns for global status bar.
     This route MUST be registered before /{campaign_id} to avoid 422 errors.
     """
     logger.info("CampaignRoutes: Fetching active campaigns progress")
-    active_campaigns = db.query(Campaign).filter(Campaign.status == "running", Campaign.is_deleted == False).all()
+    
+    query = db.query(Campaign).filter(Campaign.status == "running", Campaign.is_deleted == False)
+    if not user_has_bypass(current_user):
+        query = query.filter(Campaign.organization_id == current_user.organization_id)
+        
+    active_campaigns = query.all()
     results = []
     for c in active_campaigns:
         analytics = get_campaign_analytics(db, str(c.id))
@@ -408,7 +538,8 @@ def update_system_balance(
     
     log_action(
         db, "UPDATE_BALANCE", "SYSTEM", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"recharge_amount": amount, "new_balance": settings.meta_balance_inr},
         request=request
     )
@@ -421,18 +552,23 @@ def delete_campaign(
     campaign_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(require_delete)
 ):
     campaign = db.query(Campaign).get(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    # Isolation check
+    verify_org_access(current_user, campaign.organization_id)
+
     logger.info(f"CampaignRoutes: Soft deleting campaign {campaign_id} (status={campaign.status}) by {current_user.username}")
     campaign.is_deleted = True
     db.commit()
 
     log_action(
         db, "DELETE_CAMPAIGN", "CAMPAIGNS", 
-        user_id=str(current_user.id), username=current_user.username,
+        user_id=str(current_user.id), impersonator_id=getattr(current_user, 'impersonator_id', None), username=current_user.username,
+        organization_id=current_user.organization_id,
         details={"campaign_id": str(campaign_id), "name": campaign.name},
         request=request
     )

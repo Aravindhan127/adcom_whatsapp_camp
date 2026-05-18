@@ -1,15 +1,20 @@
 from fastapi import APIRouter, Header, Request, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.config import settings
-from app.core.database import get_db
+from app.models.organization import OrganizationConfig, Organization
+from app.core.database import get_db, logger
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.contact import Contact
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
-from app.services.meta_api import send_whatsapp_message as meta_send_msg
+from app.services.meta_api import send_whatsapp_message as meta_send_msg, format_meta_error
 from app.services.billing import ensure_conversation
 from app.services.opt_out_service import handle_opt_out
+from app.services.ai_brain import chat_with_knowledge
+from app.services.brochure_service import handle_brochure_request
+from app.services.whatsapp_chat_service import finalize_billing_on_delivery
+from app.services.audit_service import log_action
 from datetime import datetime, timedelta, timezone
 import hmac
 import hashlib
@@ -32,6 +37,7 @@ def verify_webhook_signature(body: bytes, signature: str, app_secret: str) -> bo
     return hmac.compare_digest(f"sha256={expected}", signature)
 
 @router.get("/")
+@router.get("")
 def verify_webhook(request: Request):
     # Meta webhook verification
     params = request.query_params
@@ -40,7 +46,8 @@ def verify_webhook(request: Request):
     challenge = params.get("hub.challenge")
 
     if mode == "subscribe" and token == settings.MY_VERIFY_TOKEN:
-        return int(challenge)
+        from fastapi.responses import Response
+        return Response(content=challenge, media_type="text/plain")
 
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -86,12 +93,35 @@ async def receive_webhook(
                     for msg in value["messages"]:
                         wa_id = msg["from"]
                         meta_id = msg["id"]
-                        text = msg.get("text", {}).get("body", "")
+                        msg_type = msg.get("type", "text")
+                        
+                        metadata = value.get("metadata", {})
+                        recipient_phone_id = metadata.get("phone_number_id")
+                        
+                        # Find Organization by phone_number_id
+                        org_config = db.query(OrganizationConfig).filter(OrganizationConfig.phone_number_id == recipient_phone_id).first()
+                        org_id = org_config.organization_id if org_config else None
+                        
+                        # Extract content based on type
+                        text = ""
+                        is_button_click = False
+                        
+                        if msg_type == "text":
+                            text = msg.get("text", {}).get("body", "")
+                        elif msg_type == "interactive":
+                            interactive = msg.get("interactive", {})
+                            if interactive.get("type") == "button_reply":
+                                text = interactive.get("button_reply", {}).get("title", "")
+                                is_button_click = True
+                        elif msg_type == "button":
+                            text = msg.get("button", {}).get("text", "")
+                            is_button_click = True
+                            
                         meta_ts = int(msg.get("timestamp", datetime.now(timezone.utc).timestamp()))
                         started_at = datetime.fromtimestamp(meta_ts, tz=timezone.utc)
                         
-                        # 1. Start/Update conversation
-                        conv_data = ensure_conversation(db, wa_id, "service", meta_message_id=meta_id, started_at=started_at)
+                        # 1. Start/Update conversation (Scoped to Org)
+                        conv_data = ensure_conversation(db, wa_id, "service", organization_id=org_id, meta_message_id=meta_id, started_at=started_at)
                         conv = conv_data["conversation"]
                         
                         # 2. Check for opt-out (STOP/UNSUBSCRIBE)
@@ -103,13 +133,22 @@ async def receive_webhook(
                         
                         # 3. Check for opt-in (START)
                         if text.upper().strip() == "START":
-                            contact = db.query(Contact).filter(Contact.phone_number == wa_id).first()
+                            contact_query = db.query(Contact).filter(Contact.phone_number == wa_id)
+                            if org_id:
+                                contact_query = contact_query.filter(Contact.organization_id == org_id)
+                            contact = contact_query.first()
                             if contact:
                                 contact.status = "valid"
                                 db.commit()
                                 await meta_send_msg(to=wa_id, text="Welcome back! You have been re-subscribed.")
                                 logger.info(f"Contact {wa_id} opted in.")
                                 continue # Process next message/status in SAME payload
+                            
+                        # 4. Handle Automated Brochure Request (Rule: Enterprise Feature)
+                        if handle_brochure_request(db, wa_id, text):
+                            logger.info(f"Brochure request handled for {wa_id}")
+                            # We don't continue here because we still want to save the message and notify UI
+                            pass
 
                         # Flag as needs agent
                         conv.needs_agent = True
@@ -124,10 +163,13 @@ async def receive_webhook(
                         db.add(new_msg)
                         db.commit()
                         
-                        # Look up contact name strictly from the Contact Table
+                        # Look up contact name strictly from the Contact Table (Scoped to Org)
                         # Smart Match: Use last 10 digits to resolve country code mismatches
                         last_10 = wa_id[-10:] if len(wa_id) >= 10 else wa_id
-                        contact = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}")).first()
+                        contact_query = db.query(Contact).filter(Contact.phone_number.ilike(f"%{last_10}"))
+                        if org_id:
+                            contact_query = contact_query.filter(Contact.organization_id == org_id)
+                        contact = contact_query.first()
                         contact_name = contact.name if (contact and contact.name) else None
 
                         from app.core.websocket_manager import manager
@@ -138,8 +180,42 @@ async def receive_webhook(
                             "sender": "user",
                             "contactName": contact_name,
                             "window_expires_at": conv.window_expires_at.isoformat() if conv.window_expires_at else None,
-                            "is_active": True
+                            "is_active": True,
+                            "is_button": is_button_click
                         })
+
+                        # 5. LLM Acknowledgment (Rule: Only for button clicks as requested)
+                        if is_button_click:
+                            logger.info(f"Button click detected from {wa_id}: '{text}'. Generating AI acknowledgment.")
+                            # Use the button text as query, context can be expanded later if needed
+                            ai_res = chat_with_knowledge(
+                                query=f"The user clicked a button with the title: '{text}'. Please provide a short, polite acknowledgment or response.",
+                                context="You are an automated assistant. When a user clicks a button, acknowledge their choice politely."
+                            )
+                            ack_text = ai_res.get("response", "Thank you for your response!")
+                            
+                            # Send the AI response back to WhatsApp
+                            await meta_send_msg(to=wa_id, text=ack_text)
+                            
+                            # Log the AI message in DB as well
+                            ai_msg = WhatsAppMessage(
+                                wa_id=wa_id, direction="out", message=ack_text,
+                                conversation_id=conv.id, agent_id=None # System generated
+                            )
+                            db.add(ai_msg)
+                            db.commit()
+                            
+                            # Notify UI of AI response
+                            await manager.broadcast({
+                                "type": "new_message",
+                                "wa_id": wa_id,
+                                "message": {
+                                    "id": str(ai_msg.id),
+                                    "text": ack_text,
+                                    "sender": "agent",
+                                    "timestamp": ai_msg.created_at.isoformat()
+                                }
+                            })
                 
                 # 2. Handle Status Updates
                 if "statuses" in value:
@@ -151,6 +227,22 @@ async def receive_webhook(
                             msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.meta_message_id == meta_id).first()
                             if msg:
                                 logger.info(f"Webhook Status Update: {meta_id} -> {new_status}")
+                                
+                                # Find organization context from conversation
+                                target_org_id = None
+                                if msg.conversation_id:
+                                    conv = db.query(WhatsAppConversation).get(msg.conversation_id)
+                                    if conv:
+                                        target_org_id = conv.organization_id
+                                
+                                # SERVICE LOG: Delivery Update
+                                log_action(
+                                    db=db,
+                                    action=f"WEBHOOK_STATUS_{new_status.upper()}",
+                                    module="SERVICE",
+                                    organization_id=target_org_id,
+                                    details={"meta_id": meta_id, "wa_id": msg.wa_id, "status": new_status}
+                                )
                                 
                                 # BE-FIX: Summary Analytics Sync
                                 # When status changes from 'sent' to 'delivered' or 'read', 
@@ -192,14 +284,20 @@ async def receive_webhook(
                                     errors = status.get("errors", [])
                                     if errors and isinstance(errors, list) and len(errors) > 0:
                                         err = errors[0]
-                                        code = err.get("code")
-                                        msg_text = err.get("message") or err.get("title") or "Unknown failure"
-                                        msg.status_error = f"({code}) {msg_text}" if code else msg_text
+                                        # Map webhook error fields to format_meta_error structure
+                                        error_payload = {
+                                            "code": err.get("code"),
+                                            "subcode": err.get("error_subcode"),
+                                            "error": err.get("message") or err.get("title") or "Meta delivery failed",
+                                            "fbtrace_id": err.get("fbtrace_id")
+                                        }
+                                        msg.status_error = format_meta_error(error_payload)
                                     else:
-                                        try:
-                                            msg.status_error = json.dumps(status)
-                                        except Exception:
-                                            msg.status_error = "Meta delivery failed"
+                                        msg.status_error = "Meta delivery failed"
+                                
+                                # 3. Handle Billing Finalization (Rule: Legacy Compatibility)
+                                # This updates conversation costs and billing status in the DB.
+                                finalize_billing_on_delivery(db, meta_id, new_status)
                                 
                                 # Update the actual message status
                                 msg.delivery_status = new_status

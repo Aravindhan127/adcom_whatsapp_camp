@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-export const API_BASE = import.meta.env.VITE_API_BACKEND_URL_WHATSAPP || 'http://localhost:8000';
+export const API_BASE = import.meta.env.VITE_API_BACKEND_URL_WHATSAPP || '';
 
 // SECURITY: Add timeout and CSRF protection
 const whatsappClient = axios.create({
@@ -104,6 +104,44 @@ export interface DashboardStats {
     brochures: { sent: number };
 }
 
+export interface Organization {
+    id: string;
+    name: string;
+    slug: string;
+    member_count: number;
+    is_active: boolean;
+    created_at: string;
+}
+
+export interface User {
+    id: string;
+    username: string;
+    email: string;
+    role: string;
+    role_id?: string;
+    role_name: string;
+    organization_name: string;
+    organization_id: string;
+    is_active: boolean;
+}
+
+export interface Role {
+    id: string;
+    name: string;
+    slug: string;
+    description?: string;
+    can_bypass_isolation?: boolean;
+    permission_ids?: string[];
+}
+
+export interface FieldConfig {
+    field_name: string;
+    field_label: string;
+    field_type: 'text' | 'number' | 'select';
+    is_required: boolean;
+    options?: string[];
+}
+
 // ──────────────────────────────────────────────────────────────
 // API methods
 // ──────────────────────────────────────────────────────────────
@@ -119,7 +157,7 @@ export const whatsappApi = {
         return res.data as { access_token: string; token_type: string; role: string; username: string };
     },
 
-    registerAgent: async (payload: { username: string; email: string; password: string; full_name?: string; role: string }) => {
+    registerAgent: async (payload: { username: string; email: string; password: string; full_name?: string; role: string; organization_id?: string | null }) => {
         const res = await whatsappClient.post('/api/auth/register', payload);
         return res.data;
     },
@@ -163,12 +201,13 @@ export const whatsappApi = {
     },
 
     // ── Contacts ──────────────────────────────────────────────
-    bulkImport: async (file: File, listId?: string, upsert: boolean = false, mapping?: string) => {
+    bulkImport: async (file: File, listId?: string, upsert: boolean = false, mapping?: string, organizationId?: string) => {
         const formData = new FormData();
         formData.append('file', file);
         if (listId) formData.append('list_id', listId);
         formData.append('upsert', String(upsert));
         if (mapping) formData.append('field_mapping', mapping);
+        if (organizationId) formData.append('organization_id', organizationId);
         return whatsappClient.post('/api/contacts/bulk-import', formData, {
             headers: { 'Content-Type': 'multipart/form-data' }
         });
@@ -340,6 +379,7 @@ export const whatsappApi = {
         status?: string;
         sort_by?: string;
         sort_order?: string;
+        org_id?: string;
     }): Promise<{ items: Campaign[]; total: number }> => {
         const res = await whatsappClient.get('/api/campaigns/', { params });
         return {
@@ -385,14 +425,27 @@ export const whatsappApi = {
         return res.data;
     },
 
+    retryCooldown: async (campaignId: string) => {
+        const res = await whatsappClient.post(`/api/campaigns/${campaignId}/retry-cooldown`);
+        return res.data;
+    },
+
     getCampaignStats: async (campaignId: string) => {
         const res = await whatsappClient.get(`/api/campaigns/${campaignId}/stats`);
         return res.data;
     },
 
-    getCampaignLogs: async (campaignId: string, params?: { skip?: number; limit?: number }) => {
+    getCampaignLogs: async (campaignId: string, params?: { skip?: number; limit?: number; status?: string }) => {
         const res = await whatsappClient.get(`/api/campaigns/${campaignId}/logs`, { params });
         return res.data as { total: number; items: any[] };
+    },
+
+    exportCampaignLogs: async (campaignId: string, status?: string) => {
+        const res = await whatsappClient.get(`/api/campaigns/${campaignId}/export`, {
+            params: { status },
+            responseType: 'blob'
+        });
+        return res.data;
     },
 
     deleteCampaign: async (campaignId: string) => {
@@ -401,16 +454,16 @@ export const whatsappApi = {
     },
 
     // ── Dashboard ─────────────────────────────────────────────
-    getStats: async (campaignId?: string): Promise<DashboardStats> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/stats', { params: { campaign_id: campaignId } });
+    getStats: async (campaignId?: string, orgId?: string): Promise<DashboardStats> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/stats', { params: { campaign_id: campaignId, org_id: orgId } });
         return res.data;
     },
-    getTrends: async (days: number = 7, campaignId?: string): Promise<any[]> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/trends', { params: { days, campaign_id: campaignId } });
+    getTrends: async (days: number = 7, campaignId?: string, orgId?: string): Promise<any[]> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/trends', { params: { days, campaign_id: campaignId, org_id: orgId } });
         return res.data || [];
     },
-    getRecentActivity: async (limit: number = 5, hours: number = 24, campaignId?: string): Promise<any[]> => {
-        const res = await whatsappClient.get('/api/analytics/dashboard/activity', { params: { limit, hours, campaign_id: campaignId } });
+    getRecentActivity: async (limit: number = 5, hours: number = 24, campaignId?: string, orgId?: string): Promise<any[]> => {
+        const res = await whatsappClient.get('/api/analytics/dashboard/activity', { params: { limit, hours, campaign_id: campaignId, org_id: orgId } });
         return res.data || [];
     },
 
@@ -439,8 +492,106 @@ export const whatsappApi = {
     },
 
     // ── Audit ──────────────────────────────────────────────────
-    getAuditLogs: async (params?: { skip?: number; limit?: number; module?: string; action?: string }) => {
+    getAuditLogs: async (params?: { 
+        skip?: number; 
+        limit?: number; 
+        module?: string; 
+        action?: string;
+        search?: string;
+        organization_id?: string;
+    }) => {
         const res = await whatsappClient.get('/api/audit/logs', { params });
         return res.data as { total: number; items: any[]; skip: number; limit: number };
+    },
+
+    // ── Super Admin Management ──────────────────────────────────
+    getOrganizations: async (): Promise<Organization[]> => {
+        const res = await whatsappClient.get('/api/admin/organizations');
+        return res.data;
+    },
+
+    createOrganization: async (payload: { name: string; slug: string }) => {
+        const res = await whatsappClient.post('/api/admin/organizations', payload);
+        return res.data;
+    },
+
+    getOrgConfig: async (orgId: string) => {
+        const res = await whatsappClient.get(`/api/admin/organizations/${orgId}/config`);
+        return res.data;
+    },
+
+    updateOrgConfig: async (orgId: string, payload: { whatsapp_business_id?: string; phone_number_id?: string; access_token?: string; meta_app_id?: string; meta_app_secret?: string; webhook_verify_token?: string; timezone?: string }) => {
+        const res = await whatsappClient.patch(`/api/admin/organizations/${orgId}/config`, payload);
+        return res.data;
+    },
+
+    getAllUsers: async (): Promise<User[]> => {
+        const res = await whatsappClient.get('/api/admin/users');
+        return res.data;
+    },
+
+    updateUserAccess: async (userId: string, payload: { role_id?: string; organization_id?: string; is_active?: boolean }) => {
+        const sanitizedPayload = { ...payload };
+        if (sanitizedPayload.role_id === "") delete sanitizedPayload.role_id;
+        if (sanitizedPayload.organization_id === "") delete sanitizedPayload.organization_id;
+        
+        const res = await whatsappClient.patch(`/api/admin/users/${userId}`, sanitizedPayload);
+        return res.data;
+    },
+
+    deleteUser: async (userId: string) => {
+        const res = await whatsappClient.delete(`/api/admin/users/${userId}`);
+        return res.data;
+    },
+
+    getRoles: async (): Promise<Role[]> => {
+        const res = await whatsappClient.get('/api/admin/roles');
+        return res.data;
+    },
+
+    createRole: async (payload: { name: string; slug: string; description?: string }) => {
+        const res = await whatsappClient.post('/api/admin/roles', payload);
+        return res.data;
+    },
+
+    getPermissions: async () => {
+        const res = await whatsappClient.get('/api/admin/permissions');
+        return res.data as Record<string, any[]>;
+    },
+
+    assignRolePermissions: async (roleId: string, permissionIds: string[]) => {
+        const res = await whatsappClient.put(`/api/admin/roles/${roleId}/permissions`, { permission_ids: permissionIds });
+        return res.data;
+    },
+
+    impersonateUser: async (userId: string) => {
+        const res = await whatsappClient.post(`/api/admin/users/${userId}/impersonate`);
+        return res.data;
+    },
+
+    forceLogoutUser: async (userId: string) => {
+        const res = await whatsappClient.post(`/api/admin/users/${userId}/force-logout`);
+        return res.data;
+    },
+
+    // ── Dynamic Fields (Org/System) ───────────────────────────
+    getOrgFieldConfigs: async (orgId?: string): Promise<FieldConfig[]> => {
+        const res = await whatsappClient.get('/api/contacts/config/fields', { params: { org_id: orgId } });
+        return res.data || [];
+    },
+
+    getOrganizationFieldConfigs: async (orgId: string): Promise<FieldConfig[]> => {
+        const res = await whatsappClient.get(`/api/admin/system/organizations/${orgId}/fields`);
+        return res.data || [];
+    },
+
+    configureCustomField: async (orgId: string, payload: FieldConfig) => {
+        const res = await whatsappClient.post(`/api/admin/system/organizations/${orgId}/fields`, payload);
+        return res.data;
+    },
+
+    deleteCustomField: async (orgId: string, fieldName: string) => {
+        const res = await whatsappClient.delete(`/api/admin/system/organizations/${orgId}/fields/${fieldName}`);
+        return res.data;
     },
 };

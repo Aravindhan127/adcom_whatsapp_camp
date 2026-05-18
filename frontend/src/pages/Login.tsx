@@ -1,18 +1,20 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { LogIn, User, Lock, Command, RefreshCw } from 'lucide-react';
+import { LogIn, User, Lock, Command, RefreshCw, Eye, EyeOff } from 'lucide-react';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { whatsappApi } from '../services/whatsappApi';
 
 const Login: React.FC = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setIsLoading(true);
     setError('');
     
@@ -21,11 +23,16 @@ const Login: React.FC = () => {
       const data = await whatsappApi.login(username, password);
       localStorage.setItem('token', data.access_token);
       localStorage.setItem('role', data.role);
-      navigate('/dashboard');
+      
+      if (data.role === 'super_admin' || data.role === 'superadmin') {
+        navigate('/admin/dashboard');
+      } else {
+        navigate('/dashboard');
+      }
     } catch (err: any) {
+      console.error("Login Error Details:", err);
       const status = err?.response?.status;
       if (!err?.response) {
-        // True network error - no response received
         setError('Network error. Please check your connection and try again.');
       } else if (status === 401) {
         setError('Invalid username or password. Please try again.');
@@ -34,6 +41,7 @@ const Login: React.FC = () => {
       } else {
         setError(err?.response?.data?.detail || 'Login failed. Please try again.');
       }
+    } finally {
       setIsLoading(false);
     }
   };
@@ -58,7 +66,7 @@ const Login: React.FC = () => {
             </p>
           </div>
 
-          <form onSubmit={handleLogin} className="space-y-8">
+          <div className="space-y-8">
             <div className="space-y-2">
               <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 ml-1">Username</label>
               <div className="relative group">
@@ -69,6 +77,7 @@ const Login: React.FC = () => {
                   type="text" 
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleLogin(e as any)}
                   className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg py-3 pl-12 pr-4 text-slate-900 dark:text-white font-medium placeholder-slate-400 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all"
                   placeholder="Enter username"
                   required
@@ -83,13 +92,21 @@ const Login: React.FC = () => {
                   <Lock size={18} />
                 </div>
                 <input 
-                  type="password" 
+                  type={showPassword ? "text" : "password"} 
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg py-3 pl-12 pr-4 text-slate-900 dark:text-white font-medium placeholder-slate-400 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all"
+                  onKeyDown={(e) => e.key === 'Enter' && handleLogin(e as any)}
+                  className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg py-3 pl-12 pr-12 text-slate-900 dark:text-white font-medium placeholder-slate-400 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all"
                   placeholder="Enter password"
                   required
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute inset-y-0 right-0 pr-4 flex items-center text-slate-400 hover:text-indigo-500 transition-colors"
+                >
+                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
               </div>
               <div className="flex justify-end">
                 <Link 
@@ -108,7 +125,8 @@ const Login: React.FC = () => {
             )}
 
             <button 
-              type="submit"
+              type="button"
+              onClick={handleLogin}
               disabled={isLoading}
               className="w-full bg-indigo-600 py-3.5 rounded-lg text-white font-bold shadow-lg hover:bg-indigo-700 active:scale-95 transition-all flex items-center justify-center gap-3 disabled:opacity-50"
             >
@@ -121,7 +139,7 @@ const Login: React.FC = () => {
                 </>
               )}
             </button>
-          </form>
+          </div>
         </div>
         
         <div className="mt-8 flex items-center justify-center gap-6 text-xs font-medium text-slate-500">

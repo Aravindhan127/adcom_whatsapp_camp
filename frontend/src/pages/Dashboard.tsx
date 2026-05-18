@@ -41,10 +41,13 @@ const DashboardV2: React.FC = () => {
     // Without this, changing trendPeriod in UI didn't affect WS-triggered refreshes.
     const fetchStats = useCallback(async () => {
         try {
+            const queryParams = new URLSearchParams(window.location.search);
+            const orgId = queryParams.get('orgId') || undefined;
+
             const [statsData, trendData, activityData, rateData] = await Promise.all([
-                whatsappApi.getStats(selectedCampaignId),
-                whatsappApi.getTrends(trendPeriod, selectedCampaignId),
-                whatsappApi.getRecentActivity(50, 24, selectedCampaignId),
+                whatsappApi.getStats(selectedCampaignId, orgId),
+                whatsappApi.getTrends(trendPeriod, selectedCampaignId, orgId),
+                whatsappApi.getRecentActivity(50, 24, selectedCampaignId, orgId),
                 whatsappApi.getExchangeRate()
             ]);
             setStats(statsData);
@@ -61,7 +64,9 @@ const DashboardV2: React.FC = () => {
     useEffect(() => {
         const fetchCampaigns = async () => {
             try {
-                const res = await whatsappApi.getCampaigns({ limit: 100 });
+                const queryParams = new URLSearchParams(window.location.search);
+                const orgId = queryParams.get('orgId') || undefined;
+                const res = await whatsappApi.getCampaigns({ limit: 100, org_id: orgId });
                 setCampaigns(res.items);
             } catch (err) {
                 console.error("Failed to fetch campaigns", err);

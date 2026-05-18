@@ -55,6 +55,11 @@ celery_app.conf.beat_schedule = {
         "task": "check_on_hold_campaigns",    # Must match @celery_app.task(name=...)
         "schedule": 1800.0,                   # 30 minutes
     },
+    # Auto-retry cooldown messages every 30 minutes (WABA quality protection)
+    "auto-process-cooldowns-every-30-minutes": {
+        "task": "auto_process_all_cooldowns",
+        "schedule": 1800.0,                   # 30 minutes
+    },
 }
 
 # BE-FIX: Register tasks and finalize app to bridge circular dependency correctly

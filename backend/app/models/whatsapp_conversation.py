@@ -8,6 +8,7 @@ class WhatsAppConversation(Base):
     id = Column(Integer, primary_key=True, index=True)
     wa_id = Column(String(50), nullable=False, index=True)
     category = Column(String(20), nullable=False) # 'marketing', 'utility', 'authentication', 'service'
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     meta_message_id = Column(String(255), nullable=True)
     

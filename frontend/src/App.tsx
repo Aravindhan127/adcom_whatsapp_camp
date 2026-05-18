@@ -12,6 +12,10 @@ import AuditLogs from './pages/AuditLogs.tsx';
 import Settings from './pages/Settings.tsx';
 import ForgotPassword from './pages/ForgotPassword.tsx';
 import ResetPassword from './pages/ResetPassword.tsx';
+import SuperAdminDashboard from './pages/SuperAdminDashboard.tsx';
+import OrganizationManagement from './pages/OrganizationManagement.tsx';
+import UserManagement from './pages/UserManagement.tsx';
+import RoleManagement from './pages/RoleManagement.tsx';
 import { ThemeProvider } from './components/ThemeProvider';
 import { ToastProvider } from './components/Toast';
 import './index.css';
@@ -43,6 +47,16 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   return <>{children}</>;
 };
 
+const SuperAdminRoute = ({ children }: { children: React.ReactNode }) => {
+  const role = localStorage.getItem('role');
+  
+  if (role !== 'super_admin' && role !== 'superadmin') {
+    return <Navigate to="/dashboard" />;
+  }
+
+  return <>{children}</>;
+};
+
 function App() {
   return (
     <ThemeProvider>
@@ -58,7 +72,13 @@ function App() {
               <PrivateRoute>
                 <Layout>
                   <Routes>
-                    <Route path="/" element={<Navigate to="/dashboard" />} />
+                    <Route path="/" element={
+                      (localStorage.getItem('role') === 'super_admin' || localStorage.getItem('role') === 'superadmin') ? (
+                        <Navigate to="/admin/dashboard" />
+                      ) : (
+                        <Navigate to="/dashboard" />
+                      )
+                    } />
                     <Route path="/dashboard" element={<DashboardV2 />} />
                     <Route path="/campaigns" element={<Campaigns />} />
                     <Route path="/contacts" element={<Contacts />} />
@@ -66,6 +86,23 @@ function App() {
                     <Route path="/audit" element={<AuditLogs />} />
                     <Route path="/chat" element={<Chat />} />
                     <Route path="/settings" element={<Settings />} />
+                    
+                    {/* Super Admin Routes */}
+                    <Route 
+                      path="/admin/*" 
+                      element={
+                        <SuperAdminRoute>
+                          <Routes>
+                            <Route path="/" element={<Navigate to="dashboard" />} />
+                            <Route path="dashboard" element={<SuperAdminDashboard />} />
+                            <Route path="organizations" element={<OrganizationManagement />} />
+                            <Route path="organizations/:orgId" element={<OrganizationManagement />} />
+                            <Route path="users" element={<UserManagement />} />
+                            <Route path="roles" element={<RoleManagement />} />
+                          </Routes>
+                        </SuperAdminRoute>
+                      } 
+                    />
                   </Routes>
                 </Layout>
               </PrivateRoute>

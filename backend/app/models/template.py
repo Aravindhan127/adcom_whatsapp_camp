@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Text, DateTime, JSON
+from sqlalchemy import Column, String, Text, DateTime, JSON, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -8,6 +8,7 @@ class WhatsAppTemplate(Base):
     __tablename__ = "whatsapp_templates"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), unique=True, index=True, nullable=False)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     category = Column(String(50), nullable=False) # 'MARKETING', 'UTILITY', 'AUTHENTICATION'
     language = Column(String(10), default="en_US")
     status = Column(String(20), default="PENDING") # 'APPROVED', 'REJECTED', 'PENDING', 'PAUSED'

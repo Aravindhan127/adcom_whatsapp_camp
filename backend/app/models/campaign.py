@@ -11,6 +11,7 @@ class Campaign(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     template_name = Column(String(255), nullable=False) # Maps to Meta Template Name
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     status = Column(String(20), default="draft") # 'draft', 'scheduled', 'running', 'completed', 'failed'
     is_deleted = Column(Boolean, default=False)
     media_url = Column(Text, nullable=True) # Public URL for Image/Video/Doc header
@@ -27,6 +28,12 @@ class Campaign(Base):
     read_count = Column(Integer, default=0)
     failed_count = Column(Integer, default=0)
     on_hold_count = Column(Integer, default=0)
+    
+    # Engagement Analytics
+    interested_count = Column(Integer, default=0)
+    not_interested_count = Column(Integer, default=0)
+    remind_later_count = Column(Integer, default=0)
+    opt_out_count = Column(Integer, default=0)
     failure_reason = Column(String(255), nullable=True) # e.g. 'Meta Rate Limit', 'Quality Risk'
     total_cost_inr = Column(Float, default=0.0)
     total_cost_usd = Column(Float, default=0.0)

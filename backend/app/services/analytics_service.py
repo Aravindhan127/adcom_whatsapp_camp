@@ -5,6 +5,9 @@ from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.settings import SystemSettings
 from app.models.campaign import Campaign
 from app.models.contact import Contact
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from typing import Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -42,7 +45,7 @@ def get_campaign_analytics(db: Session, campaign_id: str) -> Dict:
         "read_rate": (read / total_sent * 100) if total_sent > 0 else 0
     }
 
-def _get_period_stats(db: Session, start: datetime, end: datetime, campaign_id: Optional[str] = None) -> Dict:
+def _get_period_stats(db: Session, start: datetime, end: datetime, campaign_id: Optional[str] = None, org_id: Optional[str] = None) -> Dict:
     """Helper to fetch stats for a specific timeframe."""
     query = db.query(WhatsAppMessage).join(
         Campaign, WhatsAppMessage.campaign_id == Campaign.id
@@ -55,6 +58,8 @@ def _get_period_stats(db: Session, start: datetime, end: datetime, campaign_id: 
     
     if campaign_id:
         query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+    if org_id:
+        query = query.filter(Campaign.organization_id == org_id)
         
     msgs = query.all()
     
@@ -73,7 +78,7 @@ def _get_period_stats(db: Session, start: datetime, end: datetime, campaign_id: 
         "read_rate": (read / delivered * 100) if delivered > 0 else 0
     }
 
-def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) -> Dict:
+def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None, org_id: Optional[str] = None) -> Dict:
     """
     Aggregate overall dashboard statistics for the professional UI.
     Now includes 24h vs Previous 24h trend calculations.
@@ -91,6 +96,8 @@ def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) 
     )
     if campaign_id:
         query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+    if org_id:
+        query = query.filter(Campaign.organization_id == org_id)
         
     total = query.count()
     delivered = query.filter(WhatsAppMessage.delivery_status.in_(["delivered", "read"])).count()
@@ -116,8 +123,8 @@ def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) 
     total_spend_inr = spend_query.scalar() or 0.0
 
     # 2. Period Comparisons (Last 24h vs Previous 24h)
-    curr = _get_period_stats(db, t24h, now, campaign_id)
-    prev = _get_period_stats(db, t48h, t24h, campaign_id)
+    curr = _get_period_stats(db, t24h, now, campaign_id, org_id)
+    prev = _get_period_stats(db, t48h, t24h, campaign_id, org_id)
 
     def calc_trend(current, previous):
         if previous == 0: return 0.0 if current == 0 else 100.0
@@ -131,6 +138,8 @@ def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) 
     }
 
     # 3. System Balance
+    # Note: For impersonation, we might want to return org-specific balance if implemented, 
+    # but currently balance is global in SystemSettings.
     settings = SystemSettings.get_settings(db)
     
     return {
@@ -159,7 +168,7 @@ def get_dashboard_stats_service(db: Session, campaign_id: Optional[str] = None) 
         }
     }
 
-def get_messaging_trends(db: Session, days: int = 7, campaign_id: Optional[str] = None) -> List[Dict]:
+def get_messaging_trends(db: Session, days: int = 7, campaign_id: Optional[str] = None, org_id: Optional[str] = None) -> List[Dict]:
     """
     Get message counts (sent, delivered, read) grouped by day.
     """
@@ -182,6 +191,8 @@ def get_messaging_trends(db: Session, days: int = 7, campaign_id: Optional[str] 
     
     if campaign_id:
         query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+    if org_id:
+        query = query.filter(Campaign.organization_id == org_id)
         
     stats = query.group_by(
         func.date(WhatsAppMessage.created_at)
@@ -208,7 +219,7 @@ def get_messaging_trends(db: Session, days: int = 7, campaign_id: Optional[str] 
         
     return results
 
-def get_recent_activity(db: Session, limit: int = 5, hours: int = 24, campaign_id: Optional[str] = None) -> List[Dict]:
+def get_recent_activity(db: Session, limit: int = 5, hours: int = 24, campaign_id: Optional[str] = None, org_id: Optional[str] = None) -> List[Dict]:
     """
     Get the most recent outbound messages for the activity feed.
     Defaults to last 24 hours.
@@ -228,6 +239,8 @@ def get_recent_activity(db: Session, limit: int = 5, hours: int = 24, campaign_i
         
     if campaign_id:
         query = query.filter(WhatsAppMessage.campaign_id == campaign_id)
+    if org_id:
+        query = query.filter(Campaign.organization_id == org_id)
         
     results_raw = query.order_by(
         WhatsAppMessage.created_at.desc()
@@ -280,9 +293,10 @@ def get_recent_activity(db: Session, limit: int = 5, hours: int = 24, campaign_i
         })
     return results
 
-def get_campaign_detailed_logs(db: Session, campaign_id: str, skip: int = 0, limit: int = 100) -> Dict:
+def get_campaign_detailed_logs(db: Session, campaign_id: str, skip: int = 0, limit: int = 100, status: Optional[str] = None) -> Dict:
     """
     Get all message statuses for a specific campaign, joined with contact names.
+    Supports status filtering (e.g., 'sent', 'delivered', 'read', 'failed').
     """
     from app.models.contact import Contact
     
@@ -298,6 +312,9 @@ def get_campaign_detailed_logs(db: Session, campaign_id: str, skip: int = 0, lim
         WhatsAppMessage.campaign_id == campaign_id,
         WhatsAppMessage.direction == "out"
     )
+
+    if status and status.lower() != 'all':
+        query = query.filter(WhatsAppMessage.delivery_status == status.lower())
     
     total = query.count()
     items_raw = query.order_by(WhatsAppMessage.created_at.desc()).offset(skip).limit(limit).all()
@@ -316,4 +333,78 @@ def get_campaign_detailed_logs(db: Session, campaign_id: str, skip: int = 0, lim
         "total": total,
         "items": items
     }
+
+def export_campaign_logs_to_excel(db: Session, campaign_id: str, status: Optional[str] = None) -> io.BytesIO:
+    """
+    Export filtered campaign logs to an Excel file.
+    """
+    from app.models.contact import Contact
+    from app.models.campaign import Campaign
+
+    # Get campaign name
+    campaign = db.query(Campaign).get(campaign_id)
+    campaign_name = campaign.name if campaign else "Campaign"
+
+    # Query all logs (no limit for export)
+    query = db.query(
+        WhatsAppMessage.wa_id,
+        WhatsAppMessage.delivery_status,
+        WhatsAppMessage.status_error,
+        WhatsAppMessage.created_at,
+        Contact.name.label("contact_name")
+    ).outerjoin(
+        Contact, func.right(WhatsAppMessage.wa_id, 10) == func.right(Contact.phone_number, 10)
+    ).filter(
+        WhatsAppMessage.campaign_id == campaign_id,
+        WhatsAppMessage.direction == "out"
+    )
+
+    if status and status.lower() != 'all':
+        query = query.filter(WhatsAppMessage.delivery_status == status.lower())
+    
+    logs = query.order_by(WhatsAppMessage.created_at.desc()).all()
+
+    # Create Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recipient Logs"
+
+    # Header
+    headers = ["Name", "Phone Number", "Status", "Time", "Error Details"]
+    ws.append(headers)
+
+    # Style Header
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4F46E5", end_color="4F46E5", fill_type="solid") # Indigo-600
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    # Data
+    for log in logs:
+        ws.append([
+            log.contact_name or "Unknown",
+            log.wa_id,
+            (log.delivery_status or "sent").upper(),
+            log.created_at.strftime("%Y-%m-%d %I:%M %p"),
+            log.status_error or ""
+        ])
+
+    # Auto-adjust column width
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except: pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    # Save to buffer
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 

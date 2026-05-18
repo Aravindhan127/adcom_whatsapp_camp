@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import Column, String, DateTime, JSON, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 class AuditLog(Base):
@@ -11,6 +13,10 @@ class AuditLog(Base):
     module = Column(String(50), nullable=False, index=True) # e.g. "CAMPAIGNS", "CONTACTS", "SYSTEM"
     user_id = Column(String(36), nullable=True, index=True)
     username = Column(String(100), nullable=True)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     details = Column(JSON, nullable=True) # Context data like campaign_id, old_value, new_value
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     ip_address = Column(String(50), nullable=True)
+
+    # Relationships
+    organization = relationship("Organization")

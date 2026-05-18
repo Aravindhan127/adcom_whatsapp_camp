@@ -4,7 +4,7 @@ import {
   AlertCircle, Clock, FileText, Users, BarChart3, Loader2,
   CalendarClock, ListFilter, Command, Search, Trash2, Image,
   Filter, ChevronDown, ChevronUp, MessageSquare, ArrowUpDown,
-  ChevronLeft
+  ChevronLeft, Download, RefreshCw
 } from 'lucide-react';
 import { whatsappApi, type Campaign, type Template, type ContactList } from '../services/whatsappApi';
 import { wsService } from '../services/websocketService';
@@ -594,11 +594,33 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
   const [loading, setLoading] = useState(true);
   const [logPage, setLogPage] = useState(0);
   const [logTotal, setLogTotal] = useState(0);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [exporting, setExporting] = useState(false);
+  const [retryingCooldown, setRetryingCooldown] = useState(false);
+  const toast = useToast();
+
+  const handleRetryCooldown = async () => {
+    setRetryingCooldown(true);
+    try {
+      await whatsappApi.retryCooldown(campaign.id);
+      toast.show("Success", "Cooldown retry queued in background! Messages will be resent once health check passes.", "success");
+      fetchLogs();
+    } catch (err) {
+      console.error("Retry cooldown failed:", err);
+      toast.show("Error", "Failed to queue cooldown retry.", "error");
+    } finally {
+      setRetryingCooldown(false);
+    }
+  };
 
   const fetchLogs = async () => {
     setLoading(true);
     try {
-      const res = await whatsappApi.getCampaignLogs(campaign.id, { skip: logPage * 50, limit: 50 });
+      const res = await whatsappApi.getCampaignLogs(campaign.id, { 
+        skip: logPage * 50, 
+        limit: 50,
+        status: statusFilter === 'all' ? undefined : statusFilter
+      });
       setLogs(res.items);
       setLogTotal(res.total);
     } catch (err) {
@@ -610,7 +632,25 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
 
   useEffect(() => {
     fetchLogs();
-  }, [campaign.id, logPage]);
+  }, [campaign.id, logPage, statusFilter]);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const blob = await whatsappApi.exportCampaignLogs(campaign.id, statusFilter === 'all' ? undefined : statusFilter);
+      const url = window.URL.createObjectURL(new Blob([blob]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `campaign_logs_${campaign.name}_${new Date().toISOString().split('T')[0]}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      console.error('Export failed:', err);
+    } finally {
+      setExporting(false);
+    }
+  };
 
   // BE-FIX: Live status updates for the Log table
   useEffect(() => {
@@ -633,6 +673,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
     const isFailed = s === 'failed';
     const isRead = s === 'read';
     const isDelivered = s === 'delivered';
+    const isCooldown = s === 'cooldown';
     
     const baseClasses = "px-2 py-0.5 rounded-full text-[9px] font-black uppercase transition-all duration-200 active:scale-95 flex items-center gap-1 group";
     
@@ -640,6 +681,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
     if (isRead) colorClasses = "bg-indigo-100 text-indigo-700 hover:bg-indigo-200";
     if (isDelivered) colorClasses = "bg-emerald-100 text-emerald-700 hover:bg-emerald-200";
     if (isFailed) colorClasses = "bg-rose-100 text-rose-700 hover:bg-rose-200";
+    if (isCooldown) colorClasses = "bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/20 dark:text-amber-400";
     
     return (
       <button 
@@ -647,7 +689,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
         className={`${baseClasses} ${colorClasses}`}
       >
         {s || 'Sent'}
-        {(isFailed || isRead || isDelivered) && <AlertCircle size={8} className="transition-transform group-hover:rotate-12" />}
+        {(isFailed || isRead || isDelivered || isCooldown) && <AlertCircle size={8} className="transition-transform group-hover:rotate-12" />}
       </button>
     );
   };
@@ -655,35 +697,35 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
   const [viewingLog, setViewingLog] = useState<any | null>(null);
 
   return (
-    <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-md z-[60] flex justify-end transition-all">
-      <div className="w-full max-w-xl bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col border-l border-slate-200 dark:border-slate-800 animate-in slide-in-from-right duration-300">
+    <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-md z-[60] flex justify-center sm:justify-end transition-all p-0 sm:p-0">
+      <div className="w-full sm:max-w-xl bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col border-l border-slate-200 dark:border-slate-800 animate-in slide-in-from-right duration-300">
 
         {/* Header */}
-        <div className="p-6 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/50 dark:bg-slate-800/20">
-          <div>
-            <h2 className="text-xl font-bold text-slate-900 dark:text-white leading-tight">{campaign.name}</h2>
-            <p className="text-xs text-slate-500 font-medium">{campaign.template_name}</p>
+        <div className="p-4 sm:p-6 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/50 dark:bg-slate-800/20">
+          <div className="min-w-0">
+            <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white leading-tight truncate">{campaign.name}</h2>
+            <p className="text-xs text-slate-500 font-medium truncate">{campaign.template_name}</p>
           </div>
-          <button onClick={onClose} className="p-2 hover:bg-white dark:hover:bg-slate-800 rounded-xl shadow-sm border border-transparent hover:border-slate-200 transition-all">
+          <button onClick={onClose} className="p-2 hover:bg-white dark:hover:bg-slate-800 rounded-xl shadow-sm border border-transparent hover:border-slate-200 transition-all shrink-0">
             <X size={20} />
           </button>
         </div>
 
-        <div className="flex-1 flex flex-col overflow-hidden p-6 min-h-0">
+        <div className="flex-1 flex flex-col overflow-hidden p-4 sm:p-6 min-h-0">
           {/* Top section (Stats + Buttons) - Fixed Height */}
-          <div className="shrink-0 space-y-8 mb-4">
+          <div className="shrink-0 space-y-6 sm:space-y-8 mb-4">
             {/* Stats Grid */}
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
               {[
                 { label: 'Total Contacts', value: campaign.total_contacts, icon: Users, color: 'text-slate-600' },
                 { label: 'Sent', value: campaign.sent_count, icon: Send, color: 'text-indigo-600' },
                 { label: 'Delivered', value: campaign.delivered_count, icon: CheckCircle2, color: 'text-emerald-600' },
                 { label: 'Read', value: campaign.read_count, icon: MessageSquare, color: 'text-indigo-500' },
                 { label: 'Failed', value: campaign.failed_count, icon: AlertCircle, color: 'text-rose-600', error: campaign.failure_reason }
-              ].map(stat => (
+              ].map((stat, idx) => (
                 <div
                   key={stat.label}
-                  className={`p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800 transition-all ${stat.label === 'Failed' && stat.value > 0 ? 'border-rose-200 dark:border-rose-900/30' : ''}`}
+                  className={`p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800 transition-all ${stat.label === 'Failed' ? 'sm:col-span-2' : ''} ${stat.label === 'Failed' && stat.value > 0 ? 'border-rose-200 dark:border-rose-900/30' : ''}`}
                 >
                   <div className="flex items-center gap-2 mb-2">
                     <stat.icon size={14} className={stat.color} />
@@ -709,28 +751,71 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
             </div>
 
             {/* Action Buttons */}
-            <div className="flex gap-3">
-              {campaign.status === 'running' && (
-                <button onClick={() => onPause(campaign.id)} className="flex-1 py-3 px-4 bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold rounded-xl border border-amber-200/50 flex items-center justify-center gap-2 hover:bg-amber-100 transition-all">
-                  <Pause size={16} fill="currentColor" /> Pause
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-3 w-full">
+                {campaign.status === 'running' && (
+                  <button onClick={() => onPause(campaign.id)} className="flex-1 py-3 px-4 bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold rounded-xl border border-amber-200/50 flex items-center justify-center gap-2 hover:bg-amber-100 transition-all">
+                    <Pause size={16} fill="currentColor" /> Pause
+                  </button>
+                )}
+                {campaign.status === 'paused' && (
+                  <button onClick={() => onResume(campaign.id)} className="flex-1 py-3 px-4 bg-indigo-600 text-white font-bold rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 hover:bg-indigo-700 transition-all">
+                    <Play size={16} fill="currentColor" /> Resume
+                  </button>
+                )}
+                <button onClick={() => onDelete(campaign.id)} className="px-4 py-3 bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400 font-bold rounded-xl border border-rose-200/50 flex items-center justify-center gap-2 hover:bg-rose-100 transition-all">
+                  <Trash2 size={16} /> Delete
+                </button>
+              </div>
+
+              {logs.some(l => l.status?.toLowerCase() === 'cooldown') && (
+                <button 
+                  onClick={handleRetryCooldown} 
+                  disabled={retryingCooldown}
+                  className="w-full py-3.5 px-4 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white font-black rounded-xl shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] disabled:opacity-50"
+                >
+                  {retryingCooldown ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : (
+                    <RefreshCw size={16} />
+                  )}
+                  {retryingCooldown ? 'Queueing Retry...' : 'Retry Cooldown Messages'}
                 </button>
               )}
-              {campaign.status === 'paused' && (
-                <button onClick={() => onResume(campaign.id)} className="flex-1 py-3 px-4 bg-indigo-600 text-white font-bold rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 hover:bg-indigo-700 transition-all">
-                  <Play size={16} fill="currentColor" /> Resume
-                </button>
-              )}
-              <button onClick={() => onDelete(campaign.id)} className="px-4 py-3 bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400 font-bold rounded-xl border border-rose-200/50 flex items-center justify-center gap-2 hover:bg-rose-100 transition-all">
-                <Trash2 size={16} /> Delete
-              </button>
             </div>
           </div>
 
           {/* Detailed Logs Table - Scrollable Inner Area */}
           <div className="flex-1 flex flex-col min-h-0 pt-4 border-t border-slate-100 dark:border-slate-800 space-y-4">
-            <div className="flex items-center justify-between shrink-0">
-              <h3 className="text-xs font-black text-slate-900 dark:text-slate-300 uppercase tracking-widest">Recipient Logs</h3>
-              <span className="text-[10px] font-bold text-slate-400">{logTotal} Records</span>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center justify-between sm:justify-start gap-3">
+                <h3 className="text-xs font-black text-slate-900 dark:text-slate-300 uppercase tracking-widest">Recipient Logs</h3>
+                <span className="text-[10px] font-bold text-slate-400 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">{logTotal} Records</span>
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <CustomSelect
+                  value={statusFilter}
+                  onChange={(v) => { setStatusFilter(v); setLogPage(0); }}
+                  className="w-full sm:w-32 h-8 text-[10px]"
+                  options={[
+                    { value: "all", label: "All Status" },
+                    { value: "sent", label: "Sent" },
+                    { value: "delivered", label: "Delivered" },
+                    { value: "read", label: "Read" },
+                    { value: "failed", label: "Failed" },
+                    { value: "cooldown", label: "Cooldown" },
+                  ]}
+                />
+                <button
+                  onClick={handleExport}
+                  disabled={exporting || logs.length === 0}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-black uppercase tracking-widest rounded-lg border border-emerald-100 dark:border-emerald-900/30 hover:bg-emerald-100 transition-all disabled:opacity-50"
+                >
+                  {exporting ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                  Export
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto custom-scrollbar border border-slate-100 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900 shadow-sm relative">
@@ -784,9 +869,19 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
           <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => setViewingLog(null)} />
           <div className="relative w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden animate-in zoom-in-95 duration-200">
-            <div className={`p-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center ${viewingLog.status?.toLowerCase() === 'failed' ? 'bg-rose-50/50 dark:bg-rose-500/5' : 'bg-slate-50 dark:bg-slate-800/50'}`}>
-              <div className={`flex items-center gap-2 ${viewingLog.status?.toLowerCase() === 'failed' ? 'text-rose-600' : 'text-indigo-600'}`}>
-                {viewingLog.status?.toLowerCase() === 'failed' ? <AlertCircle size={18} /> : <Clock size={18} />}
+            <div className={`p-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center ${
+              viewingLog.status?.toLowerCase() === 'failed' ? 'bg-rose-50/50 dark:bg-rose-500/5' : 
+              viewingLog.status?.toLowerCase() === 'cooldown' ? 'bg-amber-50/50 dark:bg-amber-500/5' :
+              'bg-slate-50 dark:bg-slate-800/50'
+            }`}>
+              <div className={`flex items-center gap-2 ${
+                viewingLog.status?.toLowerCase() === 'failed' ? 'text-rose-600' : 
+                viewingLog.status?.toLowerCase() === 'cooldown' ? 'text-amber-600' : 
+                'text-indigo-600'
+              }`}>
+                {viewingLog.status?.toLowerCase() === 'failed' ? <AlertCircle size={18} /> : 
+                 viewingLog.status?.toLowerCase() === 'cooldown' ? <Clock size={18} className="text-amber-500" /> : 
+                 <Clock size={18} />}
                 <h3 className="font-black text-xs uppercase tracking-widest">Message Status Details</h3>
               </div>
               <button onClick={() => setViewingLog(null)} className="p-1 hover:bg-white dark:hover:bg-slate-800 rounded-lg transition-colors">
@@ -803,7 +898,11 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
                 </div>
                 <div className="text-right">
                   <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Status</p>
-                  <p className={`text-xs font-black uppercase ${viewingLog.status?.toLowerCase() === 'failed' ? 'text-rose-600' : 'text-emerald-600'}`}>
+                  <p className={`text-xs font-black uppercase ${
+                    viewingLog.status?.toLowerCase() === 'failed' ? 'text-rose-600' : 
+                    viewingLog.status?.toLowerCase() === 'cooldown' ? 'text-amber-600' : 
+                    'text-emerald-600'
+                  }`}>
                     {viewingLog.status}
                   </p>
                 </div>
@@ -819,11 +918,19 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
                 </div>
               )}
 
-              {/* Error Details if Failed */}
-              {viewingLog.status?.toLowerCase() === 'failed' ? (
+              {/* Error Details if Failed or Cooldown */}
+              {(viewingLog.status?.toLowerCase() === 'failed' || viewingLog.status?.toLowerCase() === 'cooldown') ? (
                 <div className="space-y-4">
-                  <div className="bg-rose-50/50 dark:bg-rose-500/5 p-4 rounded-xl border border-rose-100 dark:border-rose-900/20">
-                    <p className="text-[10px] text-rose-500 font-bold uppercase tracking-wider mb-2">Failure Reason:</p>
+                  <div className={`p-4 rounded-xl border ${
+                    viewingLog.status?.toLowerCase() === 'cooldown' ? 
+                    'bg-amber-50/50 dark:bg-amber-500/5 border-amber-100 dark:border-amber-900/20' : 
+                    'bg-rose-50/50 dark:bg-rose-500/5 border-rose-100 dark:border-rose-900/20'
+                  }`}>
+                    <p className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${
+                      viewingLog.status?.toLowerCase() === 'cooldown' ? 'text-amber-500' : 'text-rose-500'
+                    }`}>
+                      {viewingLog.status?.toLowerCase() === 'cooldown' ? 'Cooldown Warning:' : 'Failure Reason:'}
+                    </p>
                     <p className="text-sm font-bold text-slate-800 dark:text-slate-100 leading-relaxed">
                       {parseMetaError(viewingLog.error || viewingLog.statusError || 'Unknown failure')}
                     </p>
@@ -833,7 +940,9 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
                     <div className="space-y-2">
                       <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider ml-1">Technical Context:</p>
                       <div className="p-3 bg-slate-900 rounded-lg overflow-x-auto max-h-32">
-                        <pre className="text-[9px] text-rose-400 font-mono tracking-tight leading-relaxed">
+                        <pre className={`text-[9px] font-mono tracking-tight leading-relaxed ${
+                          viewingLog.status?.toLowerCase() === 'cooldown' ? 'text-amber-400' : 'text-rose-400'
+                        }`}>
                           {viewingLog.error || viewingLog.statusError}
                         </pre>
                       </div>
@@ -966,10 +1075,10 @@ const Campaigns: React.FC = () => {
     return unsub;
   }, []);
 
-  const { success, error: toastError, warning } = useToast();
+  const { success, error: toastError, warning, info: toastInfo } = useToast();
 
   const handleDelete = async (campaignId: string) => {
-    if (!window.confirm("Are you sure you want to delete this campaign? This action cannot be undone.")) return;
+    toastInfo('Processing Request', 'Attempting to delete campaign...');
 
     try {
       await whatsappApi.deleteCampaign(campaignId);

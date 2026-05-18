@@ -7,25 +7,29 @@ import app.models  # Ensure all models (including Agent) are registered for FK l
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.settings import SystemSettings
 
-def ensure_conversation(db: Session, wa_id: str, category: str, meta_message_id: str = None, commit: bool = True, started_at: datetime = None) -> Dict[str, Any]:
+def ensure_conversation(db: Session, wa_id: str, category: str, organization_id: Optional[Any] = None, meta_message_id: str = None, commit: bool = True, started_at: datetime = None) -> Dict[str, Any]:
     """
     Ensures a 24-hour conversation window per category as per Meta rules.
     Also deducts the cost from the system balance if it's a new conversation.
     Set commit=False if you want to verify sending before charging the user.
     """
-    print(f"Billing: Ensuring conversation for {wa_id} [{category}]")
+    print(f"Billing: Ensuring conversation for {wa_id} [{category}] (Org: {organization_id})")
     twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
     
     import re
     wa_id_clean = re.sub(r"\D", "", wa_id)
     
     try:
-        # Check if we already have an active conversation window for this category
-        active = db.query(WhatsAppConversation).filter(
+        # Check if we already have an active conversation window for this category within THIS organization
+        active_query = db.query(WhatsAppConversation).filter(
             WhatsAppConversation.wa_id.ilike(f"%{wa_id_clean}%"),
             WhatsAppConversation.category == category,
             WhatsAppConversation.started_at >= twenty_four_hours_ago
-        ).order_by(WhatsAppConversation.started_at.desc()).first()
+        )
+        if organization_id:
+            active_query = active_query.filter(WhatsAppConversation.organization_id == organization_id)
+            
+        active = active_query.order_by(WhatsAppConversation.started_at.desc()).first()
         
         if active:
             return {"conversation": active, "is_new": False, "cost_inr": 0.0}
@@ -76,6 +80,7 @@ def ensure_conversation(db: Session, wa_id: str, category: str, meta_message_id:
         new_conv = WhatsAppConversation(
             wa_id=wa_id_clean, # Standardized number
             category=category,
+            organization_id=organization_id,
             cost_usd=cost_usd,
             cost_inr=cost_inr,
             rate_inr=cost_inr,

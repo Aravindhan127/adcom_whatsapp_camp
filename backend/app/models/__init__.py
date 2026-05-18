@@ -8,6 +8,8 @@ from app.models.template import WhatsAppTemplate
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.audit_log import AuditLog
+from app.models.organization import Organization, OrganizationConfig, ContactFieldConfig
+from app.models.rbac import Role, Permission, role_permissions
 
 __all__ = [
     "Base",
@@ -21,4 +23,7 @@ __all__ = [
     "WhatsAppMessage",
     "WhatsAppConversation",
     "AuditLog",
+    "Organization",
+    "OrganizationConfig",
+    "ContactFieldConfig",
 ]

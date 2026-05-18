@@ -1,6 +1,6 @@
 import enum
 import uuid
-from sqlalchemy import Column, String, Text, DateTime, Integer, Enum, ForeignKey
+from sqlalchemy import Column, String, Text, DateTime, Integer, Enum, ForeignKey, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -27,6 +27,7 @@ class ContactList(Base):
     __tablename__ = "contact_lists"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -36,6 +37,7 @@ class Contact(Base):
     __tablename__ = "contacts"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     phone_number = Column(String(20), nullable=False, index=True)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     name = Column(String(255), nullable=True)
     country_code = Column(String(5), nullable=True)
     status = Column(String(20), default=ContactStatus.VALID.value, index=True)
@@ -51,6 +53,9 @@ class Contact(Base):
     product_service_interest = Column(Text, nullable=True)
     consent_confirmation = Column(String(255), nullable=True) # Opt-in proof
     
+    # Dynamic Fields Data
+    custom_fields = Column(JSON, nullable=True) # stores fields defined in ContactFieldConfig
+    
     list_id = Column(UUID(as_uuid=True), ForeignKey("contact_lists.id"), nullable=True, index=True)
     contact_list = relationship("ContactList", back_populates="contacts")
     import_id = Column(UUID(as_uuid=True), ForeignKey("import_history.id"), nullable=True)
@@ -61,6 +66,7 @@ class ImportHistory(Base):
     __tablename__ = "import_history"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filename = Column(String(255), nullable=False)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
     file_type = Column(String(10), nullable=False)
     records_count = Column(Integer, default=0)
     uploaded_by = Column(String(255), nullable=True)

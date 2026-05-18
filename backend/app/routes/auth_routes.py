@@ -5,14 +5,24 @@ from app.core.database import get_db
 from pydantic import BaseModel
 from typing import Optional
 import uuid
-from app.core.security import create_access_token, verify_password, get_password_hash, RoleChecker, get_current_user
+from app.core.security import (
+    create_access_token, 
+    verify_password, 
+    get_password_hash, 
+    RoleChecker, 
+    PermissionChecker, 
+    get_current_user,
+    user_has_bypass
+)
 from app.models.agent import Agent
+from app.models.rbac import Role
 import logging
 
 logger = logging.getLogger("adcom-api")
 
 # Access control workers
-admin_only = RoleChecker(["admin"])
+admin_only = RoleChecker(["admin", "super_admin"])
+super_admin_only = RoleChecker(["super_admin"])
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -23,7 +33,8 @@ class UserCreate(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
-    role: str = "agent" # 'admin' or 'agent'
+    role: str = "agent" # 'super_admin', 'admin', 'agent'
+    organization_id: Optional[uuid.UUID] = None
 
     @staticmethod
     def validate_password(password: str) -> tuple[bool, str]:
@@ -57,7 +68,7 @@ class ResetPasswordRequest(BaseModel):
 def register(
     user_in: UserCreate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(admin_only)
+    current_user: Agent = Depends(PermissionChecker("org.manage"))
 ):
     # SECURITY: Validate password complexity
     is_valid, error_msg = UserCreate.validate_password(user_in.password)
@@ -79,18 +90,40 @@ def register(
     if db_user:
         raise HTTPException(status_code=400, detail="Username or Email already registered")
 
+    # SECURITY: Role & Org validation
+    target_role = db.query(Role).filter(Role.slug == user_in.role).first()
+    if not target_role:
+        raise HTTPException(status_code=400, detail=f"Invalid role slug: {user_in.role}. Available: agent, admin, super_admin")
+
+    # Use role_obj for checking current user permissions (refactoring away from hardcoded strings)
+    can_bypass = user_has_bypass(current_user)
+    
+    if not can_bypass:
+        # Admin can ONLY create agents in their own organization
+        if target_role.can_bypass_isolation or target_role.slug != "agent":
+             raise HTTPException(status_code=403, detail="As an Organization Admin, you can only create 'Agent' users. Global roles require Super Admin approval.")
+        
+        user_in.organization_id = current_user.organization_id
+    else:
+        # Super Admin can create any role. 
+        # If creating Admin or Agent (roles without isolation bypass), ensure organization_id is provided.
+        if not target_role.can_bypass_isolation and not user_in.organization_id:
+             raise HTTPException(status_code=400, detail=f"The role '{target_role.name}' must be assigned to an Organization. Please select one from the dropdown.")
+    
     new_user = Agent(
         id=uuid.uuid4(),
         username=user_in.username,
         email=user_in.email,
         hashed_password=get_password_hash(user_in.password),
         full_name=user_in.full_name,
-        role=user_in.role
+        role=user_in.role, # Keep legacy string for now
+        role_id=target_role.id,
+        organization_id=user_in.organization_id
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    logger.info(f"New User Registered: {new_user.username} (Role: {new_user.role})")
+    logger.info(f"New User Registered: {new_user.username} (Role: {new_user.role}, Org: {new_user.organization_id})")
     return {"msg": f"User {new_user.username} created with role {new_user.role}"}
 
 @router.post("/login")
@@ -106,7 +139,12 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     
     logger.info(f"User Logged In: {user.username}")
     
-    access_token = create_access_token(data={"sub": user.username})
+    access_token = create_access_token(data={
+        "sub": str(user.id), 
+        "role": user.role_obj.slug if user.role_obj else user.role,
+        "org_id": str(user.organization_id) if user.organization_id else None,
+        "token_version": user.token_version
+    })
     return {
         "access_token": access_token, 
         "token_type": "bearer",

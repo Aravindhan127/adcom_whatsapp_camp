@@ -15,6 +15,12 @@ class CampaignRun(Base):
     success_count = Column(Integer, default=0)
     failed_count = Column(Integer, default=0)
     on_hold_count = Column(Integer, default=0)
+    
+    # Engagement Analytics
+    interested_count = Column(Integer, default=0)
+    not_interested_count = Column(Integer, default=0)
+    remind_later_count = Column(Integer, default=0)
+    opt_out_count = Column(Integer, default=0)
     total_cost_inr = Column(Float, default=0.0)
     total_cost_usd = Column(Float, default=0.0)
     

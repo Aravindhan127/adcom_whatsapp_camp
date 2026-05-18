@@ -132,10 +132,49 @@ def migrate_db():
         # Initialize default settings row if missing
         SystemSettings.get_settings(db)
 
+        # --- Organization & Multi-Tenancy Migration ---
+        # 1. Create Organization tables if they don't exist
+        result_o = db.execute(text("SELECT count(*) FROM information_schema.tables WHERE table_name = 'organizations'"))
+        if result_o.scalar() == 0:
+            from app.models.organization import Organization, OrganizationConfig, ContactFieldConfig
+            Base.metadata.tables['organizations'].create(engine)
+            Base.metadata.tables['organization_configs'].create(engine)
+            Base.metadata.tables['contact_field_configs'].create(engine)
+            db.commit()
+            logger.info("Adcom DB: Organization tables created.")
+
+        # 2. Add organization_id to all tables
+        tables_to_update = [
+            'agents', 'campaigns', 'contact_lists', 'contacts', 
+            'whatsapp_templates', 'audit_logs', 'whatsapp_conversations', 'import_history'
+        ]
+        for tbl in tables_to_update:
+            result = db.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{tbl}'"))
+            cols = [row[0] for row in result]
+            if 'organization_id' not in cols:
+                db.execute(text(f"ALTER TABLE {tbl} ADD COLUMN organization_id UUID REFERENCES organizations(id)"))
+                logger.info(f"Adcom DB: Added organization_id to {tbl}")
+        
+        # 3. Handle Contact-Specific dynamic fields
+        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'contacts'"))
+        contact_cols = [row[0] for row in result]
+        if 'custom_fields' not in contact_cols:
+            db.execute(text("ALTER TABLE contacts ADD COLUMN custom_fields JSON"))
+            logger.info("Adcom DB: Added custom_fields to contacts")
+
+        # --- RBAC Migration ---
+        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'agents'"))
+        agent_cols = [row[0] for row in result]
+        if 'role_id' not in agent_cols:
+            db.execute(text("ALTER TABLE agents ADD COLUMN role_id UUID REFERENCES roles(id)"))
+            logger.info("Adcom DB: Added role_id to agents")
+
         db.commit()
         logger.info("Adcom DB: Full schema migration sync completed successfully.")
     except Exception as e:
         logger.warning(f"Adcom DB Migration Warning: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         db.close()
 
@@ -144,6 +183,13 @@ try:
     migrate_db()
     Base.metadata.create_all(bind=engine)
     logger.info("Adcom DB: Metadata creation triggered.")
+    
+    # Initialize RBAC Roles and Permissions
+    from app.core.rbac_init import init_rbac
+    with SessionLocal() as db:
+        init_rbac(db)
+    logger.info("Adcom DB: RBAC initialization completed.")
+    
 except Exception as e:
     logger.error(f"Adcom DB Initialization Failed: {str(e)}")
 
@@ -176,11 +222,14 @@ async def startup_event():
     asyncio.create_task(manager.listen_for_events())
     
     # Sync live exchange rate on startup
-    from app.services.currency_service import update_system_exchange_rate
+    # Initialize RBAC and permissions
+    from app.core.rbac_init import init_rbac
     db = SessionLocal()
     try:
+        init_rbac(db)
+        from app.services.currency_service import update_system_exchange_rate
         update_system_exchange_rate(db)
-        logger.info("Adcom API: Startup exchange rate sync completed.")
+        logger.info("Adcom API: Startup sync (RBAC + Exchange Rate) completed.")
     finally:
         db.close()
         
@@ -323,11 +372,13 @@ from app.routes import (
     analytics_routes,
     campaign_routes,
     system_routes,
-    audit_routes
+    audit_routes,
+    admin_routes
 )
 
 # Include Routers
 # Include Routers
+app.include_router(admin_routes.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(webhook_routes.router, prefix="/api")
 app.include_router(template_routes.router, prefix="/api")
@@ -393,8 +444,8 @@ if __name__ == "__main__":
     else:
         logger.warning(
             "SSL key file not found at C:\\ssl\\www_ttcitaloraa_shop.key — "
-            "starting on port 3000 (HTTP only)."
+            "starting on port 8000 (HTTP only)."
         )
-        uvicorn.run(app, host="0.0.0.0", port=3000)
+        uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
