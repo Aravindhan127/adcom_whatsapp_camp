@@ -28,159 +28,11 @@ from app.core.websocket_manager import manager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("adcom-api")
 
-def migrate_db():
-    db = SessionLocal()
-    try:
-        # --- WhatsApp Templates Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'whatsapp_templates'"))
-        columns = [row[0] for row in result]
-        if 'meta_template_id' not in columns:
-            db.execute(text("ALTER TABLE whatsapp_templates ADD COLUMN meta_template_id VARCHAR(100)"))
-        if 'rejection_reason' not in columns:
-            db.execute(text("ALTER TABLE whatsapp_templates ADD COLUMN rejection_reason TEXT"))
-        if 'last_synced_at' not in columns:
-            db.execute(text("ALTER TABLE whatsapp_templates ADD COLUMN last_synced_at TIMESTAMP WITH TIME ZONE"))
-        if 'variable_mappings' not in columns:
-            db.execute(text("ALTER TABLE whatsapp_templates ADD COLUMN variable_mappings JSON"))
-        if 'media_id' not in columns:
-            db.execute(text("ALTER TABLE whatsapp_templates ADD COLUMN media_id VARCHAR(255)"))
 
-        # --- Campaigns Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'campaigns'"))
-        camp_cols = [row[0] for row in result]
-        updates = [
-            ('name', "VARCHAR(255)"),
-            ('template_name', "VARCHAR(255)"),
-            ('status', "VARCHAR(20) DEFAULT 'draft'"),
-            ('contact_list_id', "UUID"),
-            ('total_contacts', "INTEGER DEFAULT 0"),
-            ('sent_count', "INTEGER DEFAULT 0"),
-            ('delivered_count', "INTEGER DEFAULT 0"),
-            ('read_count', "INTEGER DEFAULT 0"),
-            ('failed_count', "INTEGER DEFAULT 0"),
-            ('on_hold_count', "INTEGER DEFAULT 0"),
-            ('failure_reason', "VARCHAR(255)"),
-            ('total_cost_inr', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('total_cost_usd', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('media_url', "TEXT"),
-            ('scheduled_at', "TIMESTAMP WITH TIME ZONE"),
-            ('completed_at', "TIMESTAMP WITH TIME ZONE"),
-            ('is_deleted', "BOOLEAN DEFAULT FALSE")
-        ]
-        for col, col_type in updates:
-            if col not in camp_cols:
-                db.execute(text(f"ALTER TABLE campaigns ADD COLUMN {col} {col_type}"))
-
-        # --- Campaign Runs Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'campaign_runs'"))
-        run_cols = [row[0] for row in result]
-        run_updates = [
-            ('on_hold_since', "TIMESTAMP WITH TIME ZONE"),
-            ('failure_reason', "VARCHAR(255)"),
-            ('on_hold_count', "INTEGER DEFAULT 0")
-        ]
-        for col, col_type in run_updates:
-            if col not in run_cols:
-                db.execute(text(f"ALTER TABLE campaign_runs ADD COLUMN {col} {col_type}"))
-
-
-        # --- WhatsApp Messages Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'whatsapp_messages'"))
-        msg_cols = [row[0] for row in result]
-        msg_updates = [
-            ('campaign_id', "UUID"),
-            ('whatsapp_cost', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('template_name', "VARCHAR(255)"),
-            ('input_tokens', "INTEGER DEFAULT 0"),
-            ('output_tokens', "INTEGER DEFAULT 0"),
-            ('llm_cost_usd', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('llm_cost_inr', "DOUBLE PRECISION DEFAULT 0.0")
-        ]
-        for col, col_type in msg_updates:
-            if col not in msg_cols:
-                db.execute(text(f"ALTER TABLE whatsapp_messages ADD COLUMN {col} {col_type}"))
-
-        # --- WhatsApp Conversations Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'whatsapp_conversations'"))
-        conv_cols = [row[0] for row in result]
-        conv_updates = [
-            ('billing_status', "VARCHAR(20) DEFAULT 'pending'"),
-            ('cost_usd', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('cost_inr', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('rate_usd', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('rate_inr', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('exchange_rate', "DOUBLE PRECISION DEFAULT 84.0"),
-            ('conversation_count', "INTEGER DEFAULT 0"),
-            ('cumulative_cost_usd', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('cumulative_cost_inr', "DOUBLE PRECISION DEFAULT 0.0"),
-            ('last_user_reply_at', "TIMESTAMP WITH TIME ZONE"),
-            ('window_expires_at', "TIMESTAMP WITH TIME ZONE"),
-            ('needs_agent', "BOOLEAN DEFAULT FALSE"),
-            ('meta_message_id', "VARCHAR(255)")
-        ]
-        for col, col_type in conv_updates:
-            if col not in conv_cols:
-                db.execute(text(f"ALTER TABLE whatsapp_conversations ADD COLUMN {col} {col_type}"))
-
-        # --- System Settings Migration ---
-        result_s = db.execute(text("SELECT count(*) FROM information_schema.tables WHERE table_name = 'system_settings'"))
-        if result_s.scalar() == 0:
-            Base.metadata.tables['system_settings'].create(engine)
-            db.commit()
-            logger.info("Adcom DB: system_settings table created.")
-        
-        # Initialize default settings row if missing
-        SystemSettings.get_settings(db)
-
-        # --- Organization & Multi-Tenancy Migration ---
-        # 1. Create Organization tables if they don't exist
-        result_o = db.execute(text("SELECT count(*) FROM information_schema.tables WHERE table_name = 'organizations'"))
-        if result_o.scalar() == 0:
-            from app.models.organization import Organization, OrganizationConfig, ContactFieldConfig
-            Base.metadata.tables['organizations'].create(engine)
-            Base.metadata.tables['organization_configs'].create(engine)
-            Base.metadata.tables['contact_field_configs'].create(engine)
-            db.commit()
-            logger.info("Adcom DB: Organization tables created.")
-
-        # 2. Add organization_id to all tables
-        tables_to_update = [
-            'agents', 'campaigns', 'contact_lists', 'contacts', 
-            'whatsapp_templates', 'audit_logs', 'whatsapp_conversations', 'import_history'
-        ]
-        for tbl in tables_to_update:
-            result = db.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{tbl}'"))
-            cols = [row[0] for row in result]
-            if 'organization_id' not in cols:
-                db.execute(text(f"ALTER TABLE {tbl} ADD COLUMN organization_id UUID REFERENCES organizations(id)"))
-                logger.info(f"Adcom DB: Added organization_id to {tbl}")
-        
-        # 3. Handle Contact-Specific dynamic fields
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'contacts'"))
-        contact_cols = [row[0] for row in result]
-        if 'custom_fields' not in contact_cols:
-            db.execute(text("ALTER TABLE contacts ADD COLUMN custom_fields JSON"))
-            logger.info("Adcom DB: Added custom_fields to contacts")
-
-        # --- RBAC Migration ---
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'agents'"))
-        agent_cols = [row[0] for row in result]
-        if 'role_id' not in agent_cols:
-            db.execute(text("ALTER TABLE agents ADD COLUMN role_id UUID REFERENCES roles(id)"))
-            logger.info("Adcom DB: Added role_id to agents")
-
-        db.commit()
-        logger.info("Adcom DB: Full schema migration sync completed successfully.")
-    except Exception as e:
-        logger.warning(f"Adcom DB Migration Warning: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-    finally:
-        db.close()
 
 # Initialize Database & Run Migrations (Resiliently)
+# Initialize Database
 try:
-    migrate_db()
     Base.metadata.create_all(bind=engine)
     logger.info("Adcom DB: Metadata creation triggered.")
     
@@ -194,11 +46,11 @@ except Exception as e:
     logger.error(f"Adcom DB Initialization Failed: {str(e)}")
 
 # --- SSL Configuration ---
-SSL_CERT_FILE = r"C:\ssl\www_ttcitaloraa_shop.crt"
-SSL_KEY_FILE  = r"C:\ssl\www_ttcitaloraa_shop.key"   # Place your private key here
+SSL_CERT_FILE = settings.SSL_CERT_FILE
+SSL_KEY_FILE  = settings.SSL_KEY_FILE
 
 # Detect if SSL is available
-_ssl_available = os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE)
+_ssl_available = bool(SSL_CERT_FILE and SSL_KEY_FILE and os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE))
 
 # Swagger / OpenAPI server URL
 _base_url = "https://www.ttcitaloraa.shop" if _ssl_available else "http://localhost:3000"
@@ -373,7 +225,8 @@ from app.routes import (
     campaign_routes,
     system_routes,
     audit_routes,
-    admin_routes
+    admin_routes,
+    interactive_flow_routes
 )
 
 # Include Routers
@@ -388,6 +241,7 @@ app.include_router(analytics_routes.router, prefix="/api")
 app.include_router(campaign_routes.router, prefix="/api")
 app.include_router(system_routes.router, prefix="/api")
 app.include_router(audit_routes.router, prefix="/api")
+app.include_router(interactive_flow_routes.router, prefix="/api")
 
 # --- WebSocket Endpoint ---
 from app.core.websocket_manager import manager
