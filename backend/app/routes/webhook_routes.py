@@ -8,9 +8,11 @@ from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.contact import Contact
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
-from app.services.meta_api import send_whatsapp_message as meta_send_msg, format_meta_error
+from app.services.meta_api import send_whatsapp_message as meta_send_msg, send_template_message, format_meta_error
 from app.services.billing import ensure_conversation
 from app.services.opt_out_service import handle_opt_out
+from app.models.interactive_flow import InteractiveFlow
+from app.models.template import WhatsAppTemplate
 from app.services.ai_brain import chat_with_knowledge
 from app.services.brochure_service import handle_brochure_request
 from app.services.whatsapp_chat_service import finalize_billing_on_delivery
@@ -52,6 +54,7 @@ def verify_webhook(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 @router.post("/")
+@router.post("")
 async def receive_webhook(
     request: Request,
     db: Session = Depends(get_db),
@@ -95,6 +98,15 @@ async def receive_webhook(
                         meta_id = msg["id"]
                         msg_type = msg.get("type", "text")
                         
+                        # ✅ IDEMPOTENCY CHECK: Skip if this exact message was already processed
+                        # This prevents duplicate responses when Meta retries webhook delivery
+                        already_processed = db.query(WhatsAppMessage).filter(
+                            WhatsAppMessage.meta_message_id == meta_id
+                        ).first()
+                        if already_processed:
+                            logger.info(f"Webhook: Skipping duplicate message (meta_id already processed): {meta_id[:40]}")
+                            continue
+                        
                         metadata = value.get("metadata", {})
                         recipient_phone_id = metadata.get("phone_number_id")
                         
@@ -102,8 +114,19 @@ async def receive_webhook(
                         org_config = db.query(OrganizationConfig).filter(OrganizationConfig.phone_number_id == recipient_phone_id).first()
                         org_id = org_config.organization_id if org_config else None
                         
+                        # Find Organization Config for credentials
+                        if org_config and org_config.access_token:
+                            token = org_config.access_token
+                            phone_id = org_config.phone_number_id
+                        else:
+                            from app.models.settings import SystemSettings
+                            sys_settings = SystemSettings.get_settings(db)
+                            token = sys_settings.whatsapp_token
+                            phone_id = sys_settings.phone_number_id
+                        
                         # Extract content based on type
                         text = ""
+                        button_payload = None
                         is_button_click = False
                         
                         if msg_type == "text":
@@ -111,10 +134,14 @@ async def receive_webhook(
                         elif msg_type == "interactive":
                             interactive = msg.get("interactive", {})
                             if interactive.get("type") == "button_reply":
-                                text = interactive.get("button_reply", {}).get("title", "")
+                                button_reply = interactive.get("button_reply", {})
+                                text = button_reply.get("title", "")
+                                button_payload = button_reply.get("id")
                                 is_button_click = True
                         elif msg_type == "button":
-                            text = msg.get("button", {}).get("text", "")
+                            button = msg.get("button", {})
+                            text = button.get("text", "")
+                            button_payload = button.get("payload")
                             is_button_click = True
                             
                         meta_ts = int(msg.get("timestamp", datetime.now(timezone.utc).timestamp()))
@@ -124,10 +151,12 @@ async def receive_webhook(
                         conv_data = ensure_conversation(db, wa_id, "service", organization_id=org_id, meta_message_id=meta_id, started_at=started_at)
                         conv = conv_data["conversation"]
                         
+                        
                         # 2. Check for opt-out (STOP/UNSUBSCRIBE)
                         if handle_opt_out(db, wa_id, text):
                             # Optional: Send a confirmation message "You have been unsubscribed."
-                            await meta_send_msg(to=wa_id, text="You have been unsubscribed from our updates. Type START to subscribe again.")
+                            if token and phone_id:
+                                meta_send_msg(to=wa_id, text="You have been unsubscribed from our updates. Type START to subscribe again.", token=token, phone_id=phone_id)
                             logger.info(f"Contact {wa_id} opted out.")
                             continue # Process next message/status in SAME payload
                         
@@ -140,7 +169,8 @@ async def receive_webhook(
                             if contact:
                                 contact.status = "valid"
                                 db.commit()
-                                await meta_send_msg(to=wa_id, text="Welcome back! You have been re-subscribed.")
+                                if token and phone_id:
+                                    meta_send_msg(to=wa_id, text="Welcome back! You have been re-subscribed.", token=token, phone_id=phone_id)
                                 logger.info(f"Contact {wa_id} opted in.")
                                 continue # Process next message/status in SAME payload
                             
@@ -149,9 +179,11 @@ async def receive_webhook(
                             logger.info(f"Brochure request handled for {wa_id}")
                             # We don't continue here because we still want to save the message and notify UI
                             pass
-
-                        # Flag as needs agent
+ 
+                        # Flag as needs agent and activate customer-initiated 24h window
                         conv.needs_agent = True
+                        conv.is_active = True
+                        conv.billing_status = "charged"
                         conv.last_user_reply_at = started_at
                         conv.window_expires_at = started_at + timedelta(hours=24)
                         
@@ -171,7 +203,7 @@ async def receive_webhook(
                             contact_query = contact_query.filter(Contact.organization_id == org_id)
                         contact = contact_query.first()
                         contact_name = contact.name if (contact and contact.name) else None
-
+ 
                         from app.core.websocket_manager import manager
                         await manager.notify_new_message(wa_id, {
                             "id": str(new_msg.id),
@@ -183,8 +215,238 @@ async def receive_webhook(
                             "is_active": True,
                             "is_button": is_button_click
                         })
+ 
+                        # 5. Check for Interactive Flow matching
+                        matched_flow = None
+                        if org_id:
+                            flow_query = db.query(InteractiveFlow).filter(
+                                InteractiveFlow.organization_id == org_id,
+                                InteractiveFlow.is_active == True
+                            )
+                            candidates = flow_query.all()
+                            for flow in candidates:
+                                flow_keyword = flow.trigger_keyword.strip().lower()
+                                if button_payload and button_payload.strip().lower() == flow_keyword:
+                                    matched_flow = flow
+                                    break
+                                if text and text.strip().lower() == flow_keyword:
+                                    matched_flow = flow
+                                    break
 
-                        # 5. LLM Acknowledgment (Rule: Only for button clicks as requested)
+                        if matched_flow:
+                            logger.info(f"Interactive Flow matched: '{matched_flow.name}' (Trigger: '{matched_flow.trigger_keyword}')")
+                            flow_msg = None
+                            
+                            # Execute flow automated response
+                            if matched_flow.response_type == "text":
+                                response_text = matched_flow.response_text or ""
+                                if contact:
+                                    if "{{contact.name}}" in response_text.lower():
+                                        response_text = response_text.replace("{{contact.name}}", contact.name or "")
+                                    if "{{contact.phone}}" in response_text.lower():
+                                        response_text = response_text.replace("{{contact.phone}}", contact.phone_number or "")
+                                
+                                response_data = None
+                                if token and phone_id:
+                                    response_data = meta_send_msg(to=wa_id, text=response_text, token=token, phone_id=phone_id)
+                                
+                                # Log response message in DB
+                                flow_msg = WhatsAppMessage(
+                                    wa_id=wa_id, direction="out", message=response_text,
+                                    conversation_id=conv.id, message_type="text"
+                                )
+                                if response_data and "error" in response_data:
+                                    flow_msg.delivery_status = "failed"
+                                    flow_msg.status_error = format_meta_error(response_data)
+                                    logger.error(f"Interactive Flow: Failed to send text response to {wa_id}: {response_data}")
+                                    try:
+                                        with open("meta_debug_error.log", "a", encoding="utf-8") as f:
+                                            f.write(f"\n--- INTERACTIVE FLOW ERROR ---\n"
+                                                    f"Timestamp: {datetime.now().isoformat()}\n"
+                                                    f"To: {wa_id}\n"
+                                                    f"Text: {response_text}\n"
+                                                    f"Error: {json.dumps(response_data, indent=2)}\n")
+                                    except Exception as log_err:
+                                        logger.error(f"Failed to log meta send error: {log_err}")
+                                db.add(flow_msg)
+                                db.commit()
+                            elif matched_flow.response_type == "template":
+                                template_name = matched_flow.response_template
+                                template = db.query(WhatsAppTemplate).filter(
+                                    WhatsAppTemplate.name == template_name,
+                                    WhatsAppTemplate.organization_id == org_id
+                                ).first()
+                                
+                                template_lang = "en_US"
+                                if template and template.language:
+                                    template_lang = template.language
+
+                                # Build template components
+                                vars_dict = matched_flow.variable_values or {}
+                                components = []
+                                
+                                # A. Header Media
+                                header_val = vars_dict.get("header")
+                                if header_val and isinstance(header_val, dict):
+                                    media_type = header_val.get("type", "image").lower()
+                                    media_url = header_val.get("url") or header_val.get("link")
+                                    media_id = header_val.get("id")
+                                    
+                                    media_payload = {}
+                                    if media_id:
+                                        media_payload = {"id": media_id}
+                                    elif media_url:
+                                        if str(media_url).startswith(("http://", "https://")):
+                                            media_payload = {"link": media_url}
+                                        else:
+                                            media_payload = {"id": media_url}
+                                            
+                                    if media_payload:
+                                        components.append({
+                                            "type": "header",
+                                            "parameters": [{"type": media_type, media_type: media_payload}]
+                                        })
+                                        
+                                # B. Body Parameters
+                                body_params = vars_dict.get("body") or []
+                                body_parameters = []
+                                for param in body_params:
+                                    val = str(param)
+                                    if contact:
+                                        if "{{contact.name}}" in val.lower():
+                                            val = val.replace("{{contact.name}}", contact.name or "")
+                                        elif "{{contact.phone}}" in val.lower():
+                                            val = val.replace("{{contact.phone}}", contact.phone_number or "")
+                                        elif val.lower().startswith("contact."):
+                                            field = val.split(".", 1)[1]
+                                            val = getattr(contact, field, "")
+                                    
+                                    # Fallback: if empty or only whitespace, use a single space " " to avoid Meta Graph API error #131008
+                                    if not val or not val.strip():
+                                        val = " "
+                                        
+                                    body_parameters.append({"type": "text", "text": val})
+                                    
+                                if body_parameters:
+                                    components.append({
+                                        "type": "body",
+                                        "parameters": body_parameters
+                                    })
+                                    
+                                # C. Buttons (Automatic phone injection for dynamic URL buttons)
+                                buttons_config = vars_dict.get("buttons") or []
+                                for btn in buttons_config:
+                                    btn_idx = btn.get("index", 0)
+                                    btn_type = btn.get("type", "url")
+                                    btn_text = btn.get("text", wa_id)
+                                    if contact and btn_text:
+                                        if "{{contact.phone}}" in btn_text:
+                                            btn_text = btn_text.replace("{{contact.phone}}", wa_id)
+                                        elif "{{contact.name}}" in btn_text:
+                                            btn_text = btn_text.replace("{{contact.name}}", contact.name or "")
+                                            
+                                    components.append({
+                                        "type": "button",
+                                        "sub_type": btn_type,
+                                        "index": btn_idx,
+                                        "parameters": [{"type": "text", "text": str(btn_text)}]
+                                    })
+                                    
+                                # Auto-inject phone if template has dynamic URL button and not in config
+                                if template:
+                                    buttons_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "BUTTONS"), None)
+                                    if buttons_comp:
+                                        for btn_idx, btn in enumerate(buttons_comp.get("buttons", [])):
+                                            if btn.get("type", "").upper() == "URL" and ("{?" in btn.get("url", "") or "{{" in btn.get("url", "")):
+                                                has_existing = any(b.get("index") == btn_idx for b in buttons_config)
+                                                if not has_existing:
+                                                    components.append({
+                                                        "type": "button",
+                                                        "sub_type": "url",
+                                                        "index": btn_idx,
+                                                        "parameters": [{"type": "text", "text": str(wa_id)}]
+                                                    })
+                                            elif btn.get("type", "").upper() == "QUICK_REPLY" and btn.get("id"):
+                                                has_existing = any(c.get("type") == "button" and c.get("index") == btn_idx for c in components)
+                                                if not has_existing:
+                                                    components.append({
+                                                        "type": "button",
+                                                        "sub_type": "quick_reply",
+                                                        "index": btn_idx,
+                                                        "parameters": [{"type": "payload", "payload": btn.get("id")}]
+                                                    })
+                                                    
+                                response_data = None
+                                if token and phone_id:
+                                    response_data = send_template_message(
+                                        to=wa_id,
+                                        template_name=template_name,
+                                        components=components,
+                                        language=template_lang,
+                                        token=token,
+                                        phone_id=phone_id
+                                    )
+                                    
+                                # Form message body fallback preview
+                                msg_body = f"[Template: {template_name}]"
+                                if template:
+                                    body_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "BODY"), None)
+                                    if body_comp:
+                                        msg_body = body_comp.get("text", msg_body)
+                                        for i, param in enumerate(body_params):
+                                            val = str(param)
+                                            if contact:
+                                                if "{{contact.name}}" in val.lower():
+                                                    val = val.replace("{{contact.name}}", contact.name or "")
+                                                elif "{{contact.phone}}" in val.lower():
+                                                    val = val.replace("{{contact.phone}}", contact.phone_number or "")
+                                                elif val.lower().startswith("contact."):
+                                                    field = val.split(".", 1)[1]
+                                                    val = getattr(contact, field, "")
+                                            
+                                            if not val or not val.strip():
+                                                val = " "
+                                                
+                                            msg_body = msg_body.replace(f"{{{{{i+1}}}}}", val)
+                                            
+                                flow_msg = WhatsAppMessage(
+                                    wa_id=wa_id, direction="out", message=msg_body,
+                                    conversation_id=conv.id, message_type="template",
+                                    template_name=template_name
+                                )
+                                if response_data and "error" in response_data:
+                                    flow_msg.delivery_status = "failed"
+                                    flow_msg.status_error = format_meta_error(response_data)
+                                    logger.error(f"Interactive Flow: Failed to send template {template_name} to {wa_id}: {response_data}")
+                                    try:
+                                        with open("meta_debug_error.log", "a", encoding="utf-8") as f:
+                                            f.write(f"\n--- INTERACTIVE FLOW ERROR ---\n"
+                                                    f"Timestamp: {datetime.now().isoformat()}\n"
+                                                    f"To: {wa_id}\n"
+                                                    f"Template: {template_name}\n"
+                                                    f"Error: {json.dumps(response_data, indent=2)}\n")
+                                    except Exception as log_err:
+                                        logger.error(f"Failed to log meta send error: {log_err}")
+                                db.add(flow_msg)
+                                db.commit()
+                                
+                            # Notify UI of the automated response
+                            if flow_msg:
+                                await manager.broadcast({
+                                    "type": "new_message",
+                                    "wa_id": wa_id,
+                                    "message": {
+                                        "id": str(flow_msg.id),
+                                        "text": flow_msg.message,
+                                        "sender": "agent",
+                                        "timestamp": flow_msg.created_at.isoformat() if flow_msg.created_at else datetime.now().isoformat()
+                                    }
+                                })
+                            
+                            # SKIP the general button/text AI acknowledgment
+                            continue
+ 
+                        # 6. LLM Acknowledgment (Rule: Only for button clicks as requested)
                         if is_button_click:
                             logger.info(f"Button click detected from {wa_id}: '{text}'. Generating AI acknowledgment.")
                             # Use the button text as query, context can be expanded later if needed
@@ -195,12 +457,13 @@ async def receive_webhook(
                             ack_text = ai_res.get("response", "Thank you for your response!")
                             
                             # Send the AI response back to WhatsApp
-                            await meta_send_msg(to=wa_id, text=ack_text)
+                            if token and phone_id:
+                                meta_send_msg(to=wa_id, text=ack_text, token=token, phone_id=phone_id)
                             
                             # Log the AI message in DB as well
                             ai_msg = WhatsAppMessage(
                                 wa_id=wa_id, direction="out", message=ack_text,
-                                conversation_id=conv.id, agent_id=None # System generated
+                                conversation_id=conv.id
                             )
                             db.add(ai_msg)
                             db.commit()

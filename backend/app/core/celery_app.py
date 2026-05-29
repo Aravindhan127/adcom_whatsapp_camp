@@ -45,10 +45,10 @@ celery_app.conf.update(
 )
 
 celery_app.conf.beat_schedule = {
-    # BE-FIX: Trigger scheduled campaigns every 60 seconds
+    # Trigger scheduled campaigns every 60 seconds (DO NOT lower — 10s causes duplicate sends)
     "check-scheduled-campaigns-every-minute": {
         "task": "check_scheduled_campaigns",  # Must match @celery_app.task(name=...)
-        "schedule": 10.0,
+        "schedule": 60.0,
     },
     # BE-FIX BE-2: Resume on_hold campaigns every 30 minutes (was missing — campaigns stuck forever)
     "check-on-hold-campaigns-every-30-minutes": {

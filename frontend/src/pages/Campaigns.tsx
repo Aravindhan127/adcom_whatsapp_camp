@@ -115,8 +115,12 @@ const ProgressBar = ({ value, total, color }: { value: number; total: number; co
 
 const CampaignCard = ({ campaign, onClick }: { campaign: Campaign; onClick: () => void }) => {
   const cfg = STATUS_CONFIG[campaign.status] || { label: campaign.status, color: 'text-slate-500 bg-slate-100 border-slate-200 dark:bg-slate-800 dark:border-slate-700', dot: 'bg-slate-400' };
-  const deliveryRate = campaign.sent_count > 0 ? ((campaign.delivered_count / campaign.sent_count) * 100).toFixed(1) : '0.0';
-  const progress = campaign.total_contacts > 0 ? Math.round((campaign.sent_count / campaign.total_contacts) * 100) : 0;
+  const sentCount = campaign.sent_count ?? 0;
+  const deliveredCount = campaign.delivered_count ?? 0;
+  const totalContacts = campaign.total_contacts ?? 0;
+
+  const deliveryRate = sentCount > 0 ? ((deliveredCount / sentCount) * 100).toFixed(1) : '0.0';
+  const progress = totalContacts > 0 ? Math.round((sentCount / totalContacts) * 100) : 0;
 
   return (
     <div onClick={onClick} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 cursor-pointer shadow-sm hover:shadow-md hover:border-indigo-200 dark:hover:border-indigo-900/50 transition-all group">
@@ -141,7 +145,7 @@ const CampaignCard = ({ campaign, onClick }: { campaign: Campaign; onClick: () =
         <div className="grid grid-cols-2 gap-3">
           <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700">
             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Messages Sent</p>
-            <p className="text-xl font-bold text-slate-900 dark:text-white tabular-nums">{campaign.sent_count.toLocaleString()}</p>
+            <p className="text-xl font-bold text-slate-900 dark:text-white tabular-nums">{sentCount.toLocaleString()}</p>
           </div>
           <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700">
             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Success Rate</p>
@@ -153,7 +157,7 @@ const CampaignCard = ({ campaign, onClick }: { campaign: Campaign; onClick: () =
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Overall Progress</span>
             <span className="text-xs font-bold text-slate-900 dark:text-white tabular-nums">{progress}%</span>
           </div>
-          <ProgressBar value={campaign.sent_count} total={campaign.total_contacts} color="bg-indigo-600 dark:bg-indigo-500" />
+          <ProgressBar value={sentCount} total={totalContacts} color="bg-indigo-600 dark:bg-indigo-500" />
         </div>
       </div>
     </div>
@@ -717,11 +721,11 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
             {/* Stats Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
               {[
-                { label: 'Total Contacts', value: campaign.total_contacts, icon: Users, color: 'text-slate-600' },
-                { label: 'Sent', value: campaign.sent_count, icon: Send, color: 'text-indigo-600' },
-                { label: 'Delivered', value: campaign.delivered_count, icon: CheckCircle2, color: 'text-emerald-600' },
-                { label: 'Read', value: campaign.read_count, icon: MessageSquare, color: 'text-indigo-500' },
-                { label: 'Failed', value: campaign.failed_count, icon: AlertCircle, color: 'text-rose-600', error: campaign.failure_reason }
+                { label: 'Total Contacts', value: campaign.total_contacts ?? 0, icon: Users, color: 'text-slate-600' },
+                { label: 'Sent', value: campaign.sent_count ?? 0, icon: Send, color: 'text-indigo-600' },
+                { label: 'Delivered', value: campaign.delivered_count ?? 0, icon: CheckCircle2, color: 'text-emerald-600' },
+                { label: 'Read', value: campaign.read_count ?? 0, icon: MessageSquare, color: 'text-indigo-500' },
+                { label: 'Failed', value: campaign.failed_count ?? 0, icon: AlertCircle, color: 'text-rose-600', error: campaign.failure_reason }
               ].map((stat, idx) => (
                 <div
                   key={stat.label}
@@ -744,7 +748,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onPause, onResume, onDelete }:
                   </div>
 
                   <div className="mt-3">
-                    <ProgressBar value={stat.value} total={campaign.total_contacts} color={stat.color.replace('text', 'bg')} />
+                    <ProgressBar value={stat.value} total={campaign.total_contacts ?? 0} color={stat.color.replace('text', 'bg')} />
                   </div>
                 </div>
               ))}
@@ -1175,8 +1179,12 @@ const Campaigns: React.FC = () => {
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
                   {campaigns.map(c => {
                     const cfg = STATUS_CONFIG[c.status] || { label: c.status, color: 'text-slate-500 bg-slate-100 border-slate-200', dot: 'bg-slate-400' };
-                    const deliveryRate = c.sent_count > 0 ? ((c.delivered_count / c.sent_count) * 100).toFixed(1) : '0.0';
-                    const progress = c.total_contacts > 0 ? Math.round((c.sent_count / c.total_contacts) * 100) : 0;
+                    const sentCount = c.sent_count ?? 0;
+                    const deliveredCount = c.delivered_count ?? 0;
+                    const totalContacts = c.total_contacts ?? 0;
+                    
+                    const deliveryRate = sentCount > 0 ? ((deliveredCount / sentCount) * 100).toFixed(1) : '0.0';
+                    const progress = totalContacts > 0 ? Math.round((sentCount / totalContacts) * 100) : 0;
 
                     return (
                       <tr key={c.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30 transition-colors group whitespace-nowrap font-bold">
@@ -1193,7 +1201,7 @@ const Campaigns: React.FC = () => {
                           {c.template_name}
                         </td>
                         <td className="px-5 py-3 tabular-nums text-slate-900 dark:text-white">
-                          {c.sent_count.toLocaleString()}
+                          {sentCount.toLocaleString()}
                         </td>
                         <td className="px-5 py-3 tabular-nums text-indigo-600 dark:text-indigo-400">
                           {deliveryRate}%
@@ -1201,10 +1209,10 @@ const Campaigns: React.FC = () => {
                         <td className="px-5 py-3 min-w-[120px]">
                           <div className="flex flex-col gap-1.5">
                             <div className="flex justify-between items-center text-[9px] font-black uppercase">
-                              <span className="text-slate-400">{c.sent_count} / {c.total_contacts}</span>
+                              <span className="text-slate-400">{sentCount} / {totalContacts}</span>
                               <span className="text-slate-900 dark:text-white">{progress}%</span>
                             </div>
-                            <ProgressBar value={c.sent_count} total={c.total_contacts} color="bg-indigo-600 dark:bg-indigo-500" />
+                            <ProgressBar value={sentCount} total={totalContacts} color="bg-indigo-600 dark:bg-indigo-500" />
                           </div>
                         </td>
                         <td className="px-5 py-3 text-slate-400 tabular-nums">

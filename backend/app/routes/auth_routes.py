@@ -99,9 +99,9 @@ def register(
     can_bypass = user_has_bypass(current_user)
     
     if not can_bypass:
-        # Admin can ONLY create agents in their own organization
-        if target_role.can_bypass_isolation or target_role.slug != "agent":
-             raise HTTPException(status_code=403, detail="As an Organization Admin, you can only create 'Agent' users. Global roles require Super Admin approval.")
+        # Admin can create users in their own organization, but cannot assign global bypass roles
+        if target_role.can_bypass_isolation:
+             raise HTTPException(status_code=403, detail="As an Organization Admin, you cannot assign roles with global isolation bypass privileges.")
         
         user_in.organization_id = current_user.organization_id
     else:
@@ -145,11 +145,28 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "org_id": str(user.organization_id) if user.organization_id else None,
         "token_version": user.token_version
     })
+    
+    permission_slugs = [p.slug for p in user.role_obj.permissions] if user.role_obj else []
+
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "role": user.role,
-        "username": user.username
+        "role": user.role_obj.slug if user.role_obj else user.role,
+        "username": user.username,
+        "permissions": permission_slugs
+    }
+
+@router.get("/me")
+def get_me(current_user: Agent = Depends(get_current_user)):
+    """Fetch the currently logged in user's profile and permissions."""
+    permission_slugs = [p.slug for p in current_user.role_obj.permissions] if current_user.role_obj else []
+    return {
+        "id": str(current_user.id),
+        "username": current_user.username,
+        "email": current_user.email,
+        "role": current_user.role_obj.slug if current_user.role_obj else current_user.role,
+        "organization_id": str(current_user.organization_id) if current_user.organization_id else None,
+        "permissions": permission_slugs
     }
 
 @router.post("/forgot-password")

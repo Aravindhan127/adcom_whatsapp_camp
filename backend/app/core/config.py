@@ -10,6 +10,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 class Settings(BaseSettings):
     # Database (Standardized on 127.0.0.1 for Windows compatibility)
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:root@127.0.0.1:5432/adcom_standalone")
+    BASE_URL: str = os.getenv("BASE_URL", "https://www.ttcitaloraa.shop")
 
     # Security - MUST be set in environment
     JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY")
@@ -32,6 +33,10 @@ class Settings(BaseSettings):
 
     # CORS Origins (comma-separated)
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
+
+    # SSL Config
+    SSL_CERT_FILE: Optional[str] = os.getenv("SSL_CERT_FILE")
+    SSL_KEY_FILE: Optional[str] = os.getenv("SSL_KEY_FILE")
 
     class Config:
         env_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))

@@ -1,32 +1,32 @@
 import React from 'react';
 import { NavLink, useNavigate, useLocation, Outlet } from 'react-router-dom';
 import { ThemeToggle } from './ThemeToggle';
-import { LogOut, LayoutDashboard, Users, Send, ClipboardList, MessageSquare, Settings, Command, Shield, Globe } from 'lucide-react';
+import { LogOut, LayoutDashboard, Users, Send, ClipboardList, MessageSquare, Settings, Command, Shield, Globe, Workflow, ShieldCheck, UserCog } from 'lucide-react';
 import GlobalStatus from './GlobalStatus';
+import { useAuth } from '../context/AuthContext';
 
 const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const navigate = useNavigate();
   const location = useLocation();
-  
-  const userRole = localStorage.getItem('role') || 'agent';
+  const { role: userRole, hasPermission, logout } = useAuth();
 
   const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('role');
+    logout();
     navigate('/login');
   };
 
   const queryParams = new URLSearchParams(location.search);
   const impersonateOrgId = queryParams.get('orgId');
   const isSuperAdmin = userRole === 'super_admin' || userRole === 'superadmin';
-  const showOrgLinks = !isSuperAdmin || impersonateOrgId;
+  const showOrgLinks = true; // Changed: Always show links, RBAC will filter them
 
   const navItems = [
-    { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { to: '/contacts', label: 'Contacts', icon: Users },
-    { to: '/templates', label: 'Templates', icon: ClipboardList },
-    { to: '/campaigns', label: 'Campaigns', icon: Send },
-    { to: '/chat', label: 'Live Chat', icon: MessageSquare },
+    { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: 'screen.dashboard' },
+    { to: '/contacts', label: 'Contacts', icon: Users, permission: 'screen.contacts' },
+    { to: '/templates', label: 'Templates', icon: ClipboardList, permission: 'screen.templates' },
+    { to: '/flows', label: 'Interactive Flows', icon: Workflow, permission: 'flow.view' }, // flow screen perm if exists, else flow.view
+    { to: '/campaigns', label: 'Campaigns', icon: Send, permission: 'screen.campaigns' },
+    { to: '/chat', label: 'Live Chat', icon: MessageSquare, permission: 'screen.chat' },
   ];
 
   return (
@@ -42,7 +42,7 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         </div>
 
         <nav className="flex-1 px-3 space-y-1">
-          {isSuperAdmin && !impersonateOrgId && (
+          {hasPermission('system.admin') && !impersonateOrgId && (
             <div className="mb-4 space-y-1">
               <span className="px-3 text-[10px] font-black text-slate-400 uppercase tracking-[0.25em] block mb-2 opacity-70">Platform Control</span>
               <NavLink
@@ -69,23 +69,12 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
                 <Globe size={18} strokeWidth={2.5} />
                 Organizations
               </NavLink>
-              <NavLink
-                to="/admin/users"
-                className={({ isActive }) => `
-                  flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold transition-all
-                  ${isActive 
-                    ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
-                    : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
-                `}
-              >
-                <Users size={18} strokeWidth={2.5} />
-                User Access
-              </NavLink>
               <div className="pt-2 border-b border-slate-100 dark:border-slate-800/50 mb-2" />
             </div>
           )}
 
           {showOrgLinks && navItems.map((item) => {
+            if (item.permission && !hasPermission(item.permission)) return null;
             const toWithOrg = impersonateOrgId ? `${item.to}?orgId=${impersonateOrgId}` : item.to;
             return (
               <NavLink
@@ -106,22 +95,50 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         </nav>
 
         <div className="p-4 mt-auto space-y-1">
-          {(userRole === 'admin' || isSuperAdmin) && (
+          {(hasPermission('screen.audit') || hasPermission('screen.users') || hasPermission('screen.roles') || hasPermission('screen.organizations')) && (
             <div className="pt-4 border-t border-slate-100 dark:border-slate-800 space-y-1">
               <span className="px-3 text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2">System Control</span>
-              <NavLink
-                to="/audit"
-                className={({ isActive }) => `
-                  flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
-                  ${isActive 
-                    ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
-                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
-                `}
-              >
-                <Shield size={18} strokeWidth={2} />
-                Audit Logs
-              </NavLink>
-              {userRole === 'admin' && (
+              {hasPermission('screen.audit') && (
+                <NavLink
+                  to="/audit"
+                  className={({ isActive }) => `
+                    flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
+                    ${isActive 
+                      ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
+                      : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
+                  `}
+                >
+                  <ShieldCheck size={18} strokeWidth={2} />
+                  Audit Logs
+                </NavLink>
+              )}{hasPermission('screen.users') && (
+                <NavLink
+                  to="/users"
+                  className={({ isActive }) => `
+                    flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
+                    ${isActive 
+                      ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
+                      : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
+                  `}
+                >
+                  <UserCog size={18} strokeWidth={2} />
+                  User Management
+                </NavLink>
+              )}
+              {hasPermission('screen.roles') && (
+                <NavLink
+                  to="/roles"
+                  className={({ isActive }) => `
+                    flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all
+                    ${isActive 
+                      ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' 
+                      : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}
+                  `}
+                >
+                  <Shield size={18} strokeWidth={2} />
+                  Role Management
+                </NavLink>
+              )}{hasPermission('screen.organizations') && (
                 <NavLink
                   to="/settings"
                   className={({ isActive }) => `

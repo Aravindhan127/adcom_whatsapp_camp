@@ -76,6 +76,36 @@ def _normalize_comp_placeholders(text: str) -> str:
     logger.info(f"NORMALIZATION: Final: {text!r}")
     return text
 
+def _normalize_buttons(buttons: list) -> list:
+    """
+    Normalize buttons for Meta API compliance.
+    Remaps OTP types, removes unsupported button types, and strips custom fields like 'id' or 'button_id'.
+    """
+    normalized = []
+    for btn in buttons:
+        btn = btn.copy()
+        btn_type = btn.get("type", "").upper()
+        if btn_type:
+            btn["type"] = btn_type
+        # Remap legacy COPY_CODE → OTP (Meta's actual type)
+        if btn_type == "COPY_CODE":
+            btn["type"] = "OTP"
+            btn_type = "OTP"
+        # MARKETING_OPT_OUT is NOT a valid Meta type — drop it
+        if btn_type == "MARKETING_OPT_OUT":
+            logger.warning("Dropping unsupported button type MARKETING_OPT_OUT")
+            continue
+        # OTP buttons must carry otp_type field
+        if btn_type == "OTP":
+            btn["otp_type"] = btn.get("otp_type", "COPY_CODE")
+        
+        # Remove custom fields that Meta rejects
+        btn.pop("id", None)
+        btn.pop("button_id", None)
+        
+        normalized.append(btn)
+    return normalized
+
 def update_meta_template(template_id: str, components: list, category: str = None, token: str = None):
     """
     Update an existing template on Meta using its ID.
@@ -105,8 +135,12 @@ def patch_meta_template(template_id: str, components: list, category: str = None
         if "text" in new_comp:
             new_comp["text"] = _normalize_comp_placeholders(new_comp["text"])
 
+        comp_type = new_comp.get("type", "").upper()
+        if comp_type:
+            new_comp["type"] = comp_type
+
         # 2. Fix Example Structure
-        if new_comp.get("type") == "BODY" and "{{" in new_comp.get("text", ""):
+        if comp_type == "BODY" and "{{" in new_comp.get("text", ""):
             if "example" not in new_comp:
                 new_comp["example"] = {"body_text": [[]]}
             if "body_text" not in new_comp["example"] or not isinstance(new_comp["example"]["body_text"], list):
@@ -127,7 +161,9 @@ def patch_meta_template(template_id: str, components: list, category: str = None
             new_comp["example"]["body_text"] = [inner_list]
 
         # 3. Handle Media Header Examples
-        if new_comp.get("type") == "HEADER" and new_comp.get("format") in ["IMAGE", "VIDEO", "DOCUMENT"]:
+        if comp_type == "HEADER" and new_comp.get("format", "").upper() in ["IMAGE", "VIDEO", "DOCUMENT"]:
+            if "format" in new_comp:
+                new_comp["format"] = new_comp["format"].upper()
             if "example" in new_comp and "header_handle" in new_comp["example"]:
                 handles = new_comp["example"]["header_handle"]
                 if isinstance(handles, str):
@@ -137,27 +173,11 @@ def patch_meta_template(template_id: str, components: list, category: str = None
         # Valid Meta types: QUICK_REPLY, URL, PHONE_NUMBER, OTP, VOICE_CALL,
         #   VIDEO_CALL, FLOW, CATALOG, MPM, POSTBACK, BOOKING_STATUS,
         #   PAYMENT_REQUEST, REQUEST_CONTACT_INFO
-        if new_comp.get("type") == "BUTTONS" and "buttons" in new_comp:
-            normalized_buttons = []
-            for btn in new_comp["buttons"]:
-                btn = btn.copy()
-                btn_type = btn.get("type", "")
-                # Remap legacy COPY_CODE → OTP (Meta's actual type)
-                if btn_type == "COPY_CODE":
-                    btn["type"] = "OTP"
-                    btn_type = "OTP"
-                # MARKETING_OPT_OUT is NOT a valid Meta type — drop it
-                if btn_type == "MARKETING_OPT_OUT":
-                    logger.warning("Dropping unsupported button type MARKETING_OPT_OUT")
-                    continue
-                # OTP buttons must carry otp_type field
-                if btn_type == "OTP":
-                    btn["otp_type"] = btn.get("otp_type", "COPY_CODE")
-                normalized_buttons.append(btn)
-            new_comp["buttons"] = normalized_buttons
+        if comp_type == "BUTTONS" and "buttons" in new_comp:
+            new_comp["buttons"] = _normalize_buttons(new_comp["buttons"])
 
         # 5. Handle CAROUSEL type
-        if new_comp.get("type") == "CAROUSEL" and "cards" in new_comp:
+        if comp_type == "CAROUSEL" and "cards" in new_comp:
             processed_cards = []
             for idx, card in enumerate(new_comp["cards"]):
                 new_card = card.copy()
@@ -168,8 +188,11 @@ def patch_meta_template(template_id: str, components: list, category: str = None
                         if "text" in nccomp:
                             nccomp["text"] = _normalize_comp_placeholders(nccomp["text"])
                         
+                        ccomp_type = nccomp.get("type", "").upper()
+                        if ccomp_type:
+                            nccomp["type"] = ccomp_type
                         # Example generation for card body
-                        if nccomp.get("type") == "BODY" and "{{" in nccomp.get("text", ""):
+                        if ccomp_type == "BODY" and "{{" in nccomp.get("text", ""):
                             if "example" not in nccomp:
                                 nccomp["example"] = {"body_text": [[]]}
                             inner_list = nccomp["example"]["body_text"][0]
@@ -179,7 +202,9 @@ def patch_meta_template(template_id: str, components: list, category: str = None
                             nccomp["example"]["body_text"] = [inner_list[:var_count]]
                         
                         # Handle card media handles
-                        if nccomp.get("type") == "HEADER" and nccomp.get("format") in ["IMAGE", "VIDEO"]:
+                        if ccomp_type == "HEADER" and nccomp.get("format", "").upper() in ["IMAGE", "VIDEO"]:
+                            if "format" in nccomp:
+                                nccomp["format"] = nccomp["format"].upper()
                             if "example" in nccomp and "header_handle" in nccomp["example"]:
                                 handles = nccomp["example"]["header_handle"]
                                 if isinstance(handles, str):
@@ -204,15 +229,8 @@ def patch_meta_template(template_id: str, components: list, category: str = None
                                     nccomp["example"]["header_handle"] = [cleaned_handles[0]]
                         
                         # 6. Normalize buttons INSIDE carousel cards
-                        if nccomp.get("type") == "BUTTONS" and "buttons" in nccomp:
-                            normalized_btns = []
-                            for btn in nccomp["buttons"]:
-                                btn = btn.copy()
-                                if btn.get("type") == "COPY_CODE":
-                                    btn["type"] = "OTP"
-                                    btn["otp_type"] = btn.get("otp_type", "COPY_CODE")
-                                normalized_btns.append(btn)
-                            nccomp["buttons"] = normalized_btns
+                        if ccomp_type == "BUTTONS" and "buttons" in nccomp:
+                            nccomp["buttons"] = _normalize_buttons(nccomp["buttons"])
 
                         card_comps.append(nccomp)
                     new_card["components"] = card_comps
@@ -279,8 +297,12 @@ def create_meta_template(name: str, category: str, language: str, components: li
         if "text" in new_comp:
             new_comp["text"] = _normalize_comp_placeholders(new_comp["text"])
 
+        comp_type = new_comp.get("type", "").upper()
+        if comp_type:
+            new_comp["type"] = comp_type
+
         # 2. Fix Example Structure (Management API expects a list OF lists)
-        if new_comp.get("type") == "BODY" and "{{" in new_comp.get("text", ""):
+        if comp_type == "BODY" and "{{" in new_comp.get("text", ""):
             # Auto-generate 'example' if missing entirely
             if "example" not in new_comp:
                 new_comp["example"] = {"body_text": [[]]}
@@ -308,7 +330,9 @@ def create_meta_template(name: str, category: str, language: str, components: li
             new_comp["example"]["body_text"] = [inner_list]
 
         # 3. Handle Media Header Examples
-        if new_comp.get("type") == "HEADER" and new_comp.get("format") in ["IMAGE", "VIDEO", "DOCUMENT"]:
+        if comp_type == "HEADER" and new_comp.get("format", "").upper() in ["IMAGE", "VIDEO", "DOCUMENT"]:
+            if "format" in new_comp:
+                new_comp["format"] = new_comp["format"].upper()
             if "example" in new_comp and "header_handle" in new_comp["example"]:
                 # Ensure it's a list with at least one handle
                 handles = new_comp["example"]["header_handle"]
@@ -322,27 +346,11 @@ def create_meta_template(name: str, category: str, language: str, components: li
         # Valid Meta types: QUICK_REPLY, URL, PHONE_NUMBER, OTP, VOICE_CALL,
         #   VIDEO_CALL, FLOW, CATALOG, MPM, POSTBACK, BOOKING_STATUS,
         #   PAYMENT_REQUEST, REQUEST_CONTACT_INFO
-        if new_comp.get("type") == "BUTTONS" and "buttons" in new_comp:
-            normalized_buttons = []
-            for btn in new_comp["buttons"]:
-                btn = btn.copy()
-                btn_type = btn.get("type", "")
-                # Remap legacy COPY_CODE → OTP (Meta's actual type)
-                if btn_type == "COPY_CODE":
-                    btn["type"] = "OTP"
-                    btn_type = "OTP"
-                # MARKETING_OPT_OUT is NOT a valid Meta type — drop it
-                if btn_type == "MARKETING_OPT_OUT":
-                    logger.warning("Dropping unsupported button type MARKETING_OPT_OUT")
-                    continue
-                # OTP buttons must carry otp_type field
-                if btn_type == "OTP":
-                    btn["otp_type"] = btn.get("otp_type", "COPY_CODE")
-                normalized_buttons.append(btn)
-            new_comp["buttons"] = normalized_buttons
+        if comp_type == "BUTTONS" and "buttons" in new_comp:
+            new_comp["buttons"] = _normalize_buttons(new_comp["buttons"])
 
         # 5. Handle CAROUSEL type
-        if new_comp.get("type") == "CAROUSEL" and "cards" in new_comp:
+        if comp_type == "CAROUSEL" and "cards" in new_comp:
             processed_cards = []
             for card in new_comp["cards"]:
                 new_card = card.copy()
@@ -353,8 +361,11 @@ def create_meta_template(name: str, category: str, language: str, components: li
                         if "text" in nccomp:
                             nccomp["text"] = _normalize_comp_placeholders(nccomp["text"])
                         
+                        ccomp_type = nccomp.get("type", "").upper()
+                        if ccomp_type:
+                            nccomp["type"] = ccomp_type
                         # Example generation for card body
-                        if nccomp.get("type") == "BODY" and "{{" in nccomp.get("text", ""):
+                        if ccomp_type == "BODY" and "{{" in nccomp.get("text", ""):
                             if "example" not in nccomp:
                                 nccomp["example"] = {"body_text": [[]]}
                             inner_list = nccomp["example"]["body_text"][0]
@@ -364,11 +375,17 @@ def create_meta_template(name: str, category: str, language: str, components: li
                             nccomp["example"]["body_text"] = [inner_list[:var_count]]
                         
                         # Handle card media handles
-                        if nccomp.get("type") == "HEADER" and nccomp.get("format") in ["IMAGE", "VIDEO"]:
+                        if ccomp_type == "HEADER" and nccomp.get("format", "").upper() in ["IMAGE", "VIDEO"]:
+                            if "format" in nccomp:
+                                nccomp["format"] = nccomp["format"].upper()
                             if "example" in nccomp and "header_handle" in nccomp["example"]:
                                 handles = nccomp["example"]["header_handle"]
                                 if isinstance(handles, str):
                                     nccomp["example"]["header_handle"] = [handles]
+                        
+                        # Normalize buttons inside carousel cards
+                        if ccomp_type == "BUTTONS" and "buttons" in nccomp:
+                            nccomp["buttons"] = _normalize_buttons(nccomp["buttons"])
                         
                         card_comps.append(nccomp)
                     new_card["components"] = card_comps
@@ -541,6 +558,7 @@ def send_template_message(to: str, template_name: str, components: list, languag
     }
 
     try:
+        logger.info(f"META_SEND_PAYLOAD: {json.dumps(payload, indent=2)}")
         res = session.post(url, headers=headers, json=payload, timeout=20)
         data = res.json()
         if res.status_code != 200:

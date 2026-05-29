@@ -256,13 +256,13 @@ const UserManagement: React.FC = () => {
 
                                         <td className="px-8 py-5 text-right">
                                             <div className="flex items-center justify-end gap-2 transition-all">
-                                                <button
+                                                {/* <button
                                                     onClick={() => handleImpersonate(user.id)}
                                                     className="p-2 bg-indigo-50 hover:bg-indigo-600 text-indigo-500 hover:text-white border border-indigo-200 dark:border-indigo-800 rounded-xl transition-all shadow-sm"
                                                     title="Impersonate User"
                                                 >
                                                     <UserCircle size={16} />
-                                                </button>
+                                                </button> */}
                                                 <button
                                                     onClick={() => handleForceLogout(user.id)}
                                                     className="p-2 bg-amber-50 hover:bg-amber-500 text-amber-500 hover:text-white border border-amber-200 dark:border-amber-800 rounded-xl transition-all shadow-sm"

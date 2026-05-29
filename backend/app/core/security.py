@@ -148,15 +148,9 @@ class PermissionChecker:
             self.required_permissions = required_permissions
 
     def __call__(self, user: Agent = Depends(get_current_user)):
-        # 1. Super Admin bypass (Check Role Object)
-        if user.role_obj and user.role_obj.can_bypass_isolation:
-            print(f"DEBUG: Permission bypass granted for Super Admin (Role Object): {user.username}")
-            return user
-            
-        # 2. Legacy Super Admin bypass (Check Role String)
-        if user.role in ["super_admin", "superadmin"]:
-            print(f"DEBUG: Permission bypass granted for Super Admin (Role String): {user.username}")
-            return user
+        # Notice: Super Admins no longer bypass permission checks.
+        # They MUST have the permission assigned in the database matrix.
+        # Isolation bypass is handled separately in verify_org_access.
 
         if not user.role_obj:
             print(f"DEBUG: Permission DENIED - No role object for user: {user.username} (Role string: {user.role})")

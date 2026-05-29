@@ -125,9 +125,18 @@ def check_scheduled_campaigns():
                 logger.warning(f"Meta limits reached, skipping scheduled campaign {campaign.id}")
                 continue
 
-            # Update status to running and start the run via service
-            # IMPORTANT: Pass scheduled_at=None so start_campaign_run_v2 is called immediately
-            # Without this, the service would re-schedule instead of launching!
+            # ANTI-DUPLICATE GUARD: Mark campaign as 'running' BEFORE launching.
+            # Without this, if the Beat fires again (or two workers run simultaneously)
+            # before start_campaign_run_v2 commits, the campaign is still 'scheduled'
+            # and gets launched TWICE → duplicate messages.
+            campaign.status = "running"
+            try:
+                db.commit()
+            except Exception as lock_err:
+                db.rollback()
+                logger.warning(f"Could not lock campaign {campaign.id} for launch (likely a race): {lock_err}")
+                continue  # Skip — another worker already picked it up
+
             from app.services.campaign_service import start_campaign_run_v2
             result = start_campaign_run_v2(db, str(campaign.id))
 
@@ -139,6 +148,7 @@ def check_scheduled_campaigns():
                 campaign.status = "failed"
                 campaign.failure_reason = error_msg
                 db.commit()
+
 
     except Exception as e:
         logger.error(f"Error in check_scheduled_campaigns: {str(e)}")
@@ -202,6 +212,25 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
             return "ABORTED: Campaign was deleted"
             
         template = db.query(WhatsAppTemplate).filter(WhatsAppTemplate.name == campaign.template_name).first()
+        
+        # Dynamically register template tracked links in Redis before starting the batch
+        if template and template.variable_mappings and "tracked_links" in template.variable_mappings:
+            try:
+                import json
+                redis_client = celery_app.backend.client
+                for sc, dest in template.variable_mappings["tracked_links"].items():
+                    redis_key = f"shortcode:{sc}"
+                    redis_client.set(
+                        redis_key,
+                        json.dumps({
+                            "destination_url": dest,
+                            "campaign_id": str(campaign_id)
+                        })
+                    )
+                    logger.info(f"Worker: Dynamically registered shortcode mapping '{redis_key}' -> '{dest}' in Redis")
+            except Exception as redis_err:
+                logger.error(f"Worker: Failed to dynamically register shortcodes in Redis: {redis_err}")
+                
         # Use template's actual language with 'en_US' fallback.
         # Note: We now respect 'en' if the template was approved as 'en'.
         template_language = template.language if (template and template.language) else "en_US"
@@ -462,7 +491,11 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     
                     if required_var_count > 0:
                         if campaign.template_params:
-                            param_keys = sorted(campaign.template_params.keys(), key=lambda x: int(x) if x.isdigit() else 999)
+                            # Only keep keys that are digits (variables) and ignore metadata like "tracked_links"
+                            param_keys = sorted(
+                                [k for k in campaign.template_params.keys() if k.isdigit()],
+                                key=lambda x: int(x)
+                            )
                             for pk in param_keys:
                                 mapping = campaign.template_params[pk]
                                 val = ""
@@ -479,10 +512,32 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     # Always append body if it exists, even with empty parameters (required for some templates)
                     message_components.append({
                         "type": "body",
-                        "parameters": body_parameters
+                        "parameters": body_parameters[:required_var_count]
                     })
 
-                # C. Handle Carousel Component
+                # C. Handle Buttons (Dynamic URL Tracking & Quick Reply Payloads)
+                buttons_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "BUTTONS"), None)
+                if buttons_comp:
+                    for btn_idx, btn in enumerate(buttons_comp.get("buttons", [])):
+                        if btn.get("type", "").upper() == "URL" and "{{" in btn.get("url", ""):
+                            # Dynamic URL button requires parameters!
+                            # We automatically inject the recipient's phone number as the text parameter for {{1}}
+                            message_components.append({
+                                "type": "button",
+                                "sub_type": "url",
+                                "index": btn_idx,
+                                "parameters": [{"type": "text", "text": str(phone)}]
+                            })
+                            logger.info(f"Worker: Injected phone '{phone}' as parameter for dynamic URL button index {btn_idx}")
+                        elif btn.get("type", "").upper() == "QUICK_REPLY" and btn.get("id"):
+                            message_components.append({
+                                "type": "button",
+                                "sub_type": "quick_reply",
+                                "index": btn_idx,
+                                "parameters": [{"type": "payload", "payload": btn.get("id")}]
+                            })
+
+                # D. Handle Carousel Component
                 carousel_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "CAROUSEL"), None)
                 if carousel_comp:
                     carousel_cards = []
@@ -521,11 +576,14 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                                 # We must include them in the message payload to ensure they appear.
                                 # Each button in a carousel card is indexed.
                                 for b_idx, btn in enumerate(ccomp.get("buttons", [])):
+                                    btn_params = []
+                                    if btn.get("type", "").upper() == "QUICK_REPLY" and btn.get("id"):
+                                        btn_params = [{"type": "payload", "payload": btn.get("id")}]
                                     card_components.append({
                                         "type": "button",
-                                        "sub_type": "url" if btn.get("type") == "URL" else "quick_reply",
-                                        "index": str(b_idx),
-                                        "parameters": []
+                                        "sub_type": "url" if btn.get("type", "").upper() == "URL" else "quick_reply",
+                                        "index": b_idx,
+                                        "parameters": btn_params
                                     })
                         
                         if card_components:
@@ -563,11 +621,12 @@ def send_campaign_batch(self, run_id: str, campaign_id: str, offset: int, limit:
                     # Store a human-readable but detailed error reason
                     status_error = format_meta_error(response)
                     
-                    # Handle Rate & Account Limits
-                    if code in [429, 131045, 131048]:
-                        # Rate limit exponential backoff: 2, 4, 8 mins
+                    # Handle Rate, Account Limits, and Temporary Network Errors
+                    if code in [429, 131045, 131048, 1, 2, 131000, 131016, 131057, 133004]:
+                        # Exponential backoff: 2, 4, 8 mins
                         wait_time = (120 * (2 ** self.request.retries)) + random.uniform(5, 15)
-                        raise self.retry(exc=Exception(f"Meta Rate Limit {code}"), countdown=wait_time)
+                        logger.warning(f"Worker: Transient error {code}. Retrying in {wait_time}s... (Attempt {self.request.retries + 1}/3)")
+                        raise self.retry(exc=Exception(f"Transient Meta Error {code}"), countdown=wait_time)
 
                     # Check if it is a Cooldown error (Code 131049)
                     is_cooldown = (code == 131049 or "131049" in str(error_msg))
@@ -897,7 +956,11 @@ def retry_campaign_cooldown(campaign_id: str):
                     body_parameters = []
                     if required_var_count > 0:
                         if campaign.template_params:
-                            param_keys = sorted(campaign.template_params.keys(), key=lambda x: int(x) if x.isdigit() else 999)
+                            # Only keep keys that are digits (variables) and ignore metadata like "tracked_links"
+                            param_keys = sorted(
+                                [k for k in campaign.template_params.keys() if k.isdigit()],
+                                key=lambda x: int(x)
+                            )
                             for pk in param_keys:
                                 mapping = campaign.template_params[pk]
                                 val = ""
@@ -915,6 +978,25 @@ def retry_campaign_cooldown(campaign_id: str):
                             "type": "body",
                             "parameters": body_parameters[:required_var_count]
                         })
+
+                # C. Handle Buttons (Retry Loop)
+                buttons_comp = next((c for c in (template.components or []) if c.get("type", "").upper() == "BUTTONS"), None)
+                if buttons_comp:
+                    for btn_idx, btn in enumerate(buttons_comp.get("buttons", [])):
+                        if btn.get("type", "").upper() == "URL" and "{{" in btn.get("url", ""):
+                            message_components.append({
+                                "type": "button",
+                                "sub_type": "url",
+                                "index": btn_idx,
+                                "parameters": [{"type": "text", "text": str(contact.phone_number)}]
+                            })
+                        elif btn.get("type", "").upper() == "QUICK_REPLY" and btn.get("id"):
+                            message_components.append({
+                                "type": "button",
+                                "sub_type": "quick_reply",
+                                "index": btn_idx,
+                                "parameters": [{"type": "payload", "payload": btn.get("id")}]
+                            })
 
                 # Send
                 response = send_template_message(

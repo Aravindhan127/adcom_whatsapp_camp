@@ -91,6 +91,46 @@ def create_template(
     # Validate: body must not end with a variable
     validate_template_body(template_in.components)
     
+    # Automatically rewrite static website URL buttons to dynamic tracked redirection links
+    tracked_links = {}
+    modified_components = []
+    
+    for comp in template_in.components:
+        new_comp = comp.copy()
+        if new_comp.get("type", "").upper() == "BUTTONS" and "buttons" in new_comp:
+            modified_buttons = []
+            for btn in new_comp["buttons"]:
+                new_btn = btn.copy()
+                if new_btn.get("type", "").upper() == "URL":
+                    url_str = new_btn.get("url", "")
+                    # Check if it's static (doesn't contain {{1}})
+                    if "{{" not in url_str:
+                        # Generate unique short code
+                        import uuid
+                        short_code = f"lnk_{uuid.uuid4().hex[:8]}"
+                        tracked_links[short_code] = url_str
+                        
+                        # Rewrite to dynamic tracked URL
+                        from app.core.config import settings
+                        base_url = settings.BASE_URL
+                        new_btn["url"] = f"{base_url}/api/campaigns/r/{short_code}?to={{{{1}}}}"
+                        
+                        # Add Meta dynamic parameter example
+                        new_btn["example"] = ["917397349160"]
+                        logger.info(f"Link Track Shortener: Automatically rewrote static URL '{url_str}' -> '{new_btn['url']}' with shortcode '{short_code}'")
+                modified_buttons.append(new_btn)
+            new_comp["buttons"] = modified_buttons
+        modified_components.append(new_comp)
+        
+    # Replace in template_in
+    template_in.components = modified_components
+    
+    # Save the tracked links in variable_mappings
+    if tracked_links:
+        if not template_in.variable_mappings:
+            template_in.variable_mappings = {}
+        template_in.variable_mappings["tracked_links"] = tracked_links
+        
     meta_id = None
     status = "LOCAL_ONLY"
     
@@ -304,7 +344,22 @@ def list_templates(
         query = query.filter(WhatsAppTemplate.name.ilike(f"%{search}%"))
 
     total = query.count()
-    
+
+    # Status counts: Always count ALL statuses (ignore current status filter) for accurate badges
+    base_count_query = db.query(WhatsAppTemplate)
+    if not user_has_bypass(current_user):
+        base_count_query = base_count_query.filter(WhatsAppTemplate.organization_id == current_user.organization_id)
+    if search:
+        base_count_query = base_count_query.filter(WhatsAppTemplate.name.ilike(f"%{search}%"))
+    if category:
+        base_count_query = base_count_query.filter(WhatsAppTemplate.category.ilike(category))
+
+    status_counts = {
+        "APPROVED": base_count_query.filter(WhatsAppTemplate.status == "APPROVED").count(),
+        "PENDING": base_count_query.filter(WhatsAppTemplate.status == "PENDING").count(),
+        "REJECTED": base_count_query.filter(WhatsAppTemplate.status == "REJECTED").count(),
+    }
+
     # Sorting
     valid_columns = {
         "name": WhatsAppTemplate.name,
@@ -325,7 +380,7 @@ def list_templates(
 
     items = query.offset(skip).limit(limit).all()
     
-    return {"total": total, "items": items}
+    return {"total": total, "items": items, "status_counts": status_counts}
 
 
 class TemplateConfigure(BaseModel):

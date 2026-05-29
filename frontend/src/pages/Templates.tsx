@@ -239,6 +239,7 @@ const Templates: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'APPROVED' | 'PENDING' | 'REJECTED'>('ALL');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
+  const [statusCounts, setStatusCounts] = useState<{ APPROVED: number; PENDING: number; REJECTED: number }>({ APPROVED: 0, PENDING: 0, REJECTED: 0 });
   const limit = 10;
   const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
 
@@ -338,6 +339,9 @@ const Templates: React.FC = () => {
       });
       setTemplates(res.items || []);
       setTotal(res.total || 0);
+      if (res.status_counts) {
+        setStatusCounts(res.status_counts as { APPROVED: number; PENDING: number; REJECTED: number });
+      }
     } catch (error) {
       console.error('Error fetching templates:', error);
     } finally {
@@ -402,6 +406,7 @@ const Templates: React.FC = () => {
     if (type === 'PHONE_NUMBER') newBtn.phone_number = '';
     if (type === 'VOICE_CALL') newBtn.phone_number = '';
     if (type === 'OTP') { newBtn.text = 'Copy Code'; newBtn.otp_type = 'COPY_CODE'; }
+    if (type === 'QUICK_REPLY') newBtn.button_id = ''; // Interactive Flow trigger ID
     setButtons([...buttons, newBtn]);
   };
 
@@ -478,7 +483,8 @@ const Templates: React.FC = () => {
         url: btn.url || '',
         phone_number: btn.phone_number || '',
         otp_type: btn.otp_type || '',
-        example: btn.example || []
+        example: btn.example || [],
+        button_id: btn.type === 'QUICK_REPLY' ? (btn.id || '') : '' // Restore Interactive Flow button_id
       })));
     }
 
@@ -747,6 +753,11 @@ const Templates: React.FC = () => {
                 btn.otp_type = b.otp_type || 'COPY_CODE';
                 if (b.example?.length) btn.example = b.example;
               }
+              // ✅ Interactive Flow: Pass button_id as the Meta reply button ID
+              // When a user clicks this button, Meta sends back button_reply.id = this value
+              if (btn.type === 'QUICK_REPLY' && b.button_id?.trim()) {
+                btn.id = b.button_id.trim().toLowerCase().replace(/\s+/g, '_');
+              }
               return btn;
             })
           });
@@ -915,9 +926,9 @@ const Templates: React.FC = () => {
           </div>
         </div>
         <div className="hidden md:flex items-center gap-6 text-center">
-          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Approved</p><p className="text-xl font-bold text-emerald-600 tabular-nums">{templates.filter(t => t.status === 'APPROVED').length}</p></div>
-          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Pending</p><p className="text-xl font-bold text-amber-500 tabular-nums">{templates.filter(t => t.status === 'PENDING').length}</p></div>
-          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Rejected</p><p className="text-xl font-bold text-rose-500 tabular-nums">{templates.filter(t => t.status === 'REJECTED').length}</p></div>
+          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Approved</p><p className="text-xl font-bold text-emerald-600 tabular-nums">{statusCounts.APPROVED}</p></div>
+          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Pending</p><p className="text-xl font-bold text-amber-500 tabular-nums">{statusCounts.PENDING}</p></div>
+          <div className="space-y-0.5"><p className="text-[10px] font-bold text-slate-400 uppercase">Rejected</p><p className="text-xl font-bold text-rose-500 tabular-nums">{statusCounts.REJECTED}</p></div>
         </div>
       </div>
 
@@ -1099,7 +1110,7 @@ const Templates: React.FC = () => {
                       { id: 'IMAGE', label: 'Image', icon: ImageIcon },
                       { id: 'VIDEO', label: 'Video', icon: Video },
                       { id: 'DOCUMENT', label: 'Doc', icon: FileIcon },
-                      { id: 'CAROUSEL', label: 'Carousel', icon: Layers },
+                      // { id: 'CAROUSEL', label: 'Carousel', icon: Layers },
                     ].map(h => (
                       <button key={h.id} type="button" onClick={() => setHeaderType(h.id)} className={`flex flex-col items-center justify-center gap-3 p-4 rounded-2xl border-2 transition-all duration-300 ${headerType === h.id ? 'border-indigo-600 bg-indigo-50/50 dark:bg-indigo-500/10 text-indigo-600 shadow-sm' : 'border-slate-50 dark:border-white/5 text-slate-400 hover:border-slate-200 dark:hover:border-white/10'}`}>
                         <h.icon size={22} className={headerType === h.id ? 'scale-110 transition-transform' : ''} />
@@ -1494,6 +1505,19 @@ const Templates: React.FC = () => {
                                 )}
                                 {btn.type === 'OTP' && (
                                   <input value={btn.text} onChange={e => updateButton(i, { text: e.target.value })} placeholder="Copy Code" className="w-full p-2 bg-white dark:bg-zinc-900 border border-slate-100 dark:border-white/5 rounded-xl text-xs font-bold outline-none" />
+                                )}
+                                {btn.type === 'QUICK_REPLY' && (
+                                  <div className="space-y-1">
+                                    <input
+                                      value={btn.button_id || ''}
+                                      onChange={e => updateButton(i, { button_id: e.target.value })}
+                                      placeholder="Button ID (e.g. click_product_a)"
+                                      className="w-full p-2 bg-indigo-50 dark:bg-indigo-500/10 border border-indigo-200/50 dark:border-indigo-500/20 rounded-xl text-xs font-mono outline-none focus:ring-1 focus:ring-indigo-400"
+                                    />
+                                    <p className="text-[9px] text-indigo-500 dark:text-indigo-400 font-semibold px-1">
+                                      ⚡ This ID must match a <strong>Flow Trigger Keyword</strong> to auto-reply when clicked.
+                                    </p>
+                                  </div>
                                 )}
                                 {btn.type === 'URL' && (
                                   <input value={btn.url || ''} onChange={e => updateButton(i, { url: e.target.value })} placeholder="https://example.com" className="w-full p-2 bg-white dark:bg-zinc-900 border border-slate-100 dark:border-white/5 rounded-xl text-xs outline-none" />

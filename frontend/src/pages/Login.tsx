@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { LogIn, User, Lock, Command, RefreshCw, Eye, EyeOff } from 'lucide-react';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { whatsappApi } from '../services/whatsappApi';
+import { useAuth } from '../context/AuthContext';
 
 const Login: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -11,6 +12,7 @@ const Login: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
+  const { login } = useAuth();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,8 +23,7 @@ const Login: React.FC = () => {
     try {
       // For development, if username is 'admin', password 'admin123'
       const data = await whatsappApi.login(username, password);
-      localStorage.setItem('token', data.access_token);
-      localStorage.setItem('role', data.role);
+      login(data.access_token, data.role, data.permissions || [], { username: data.username });
       
       if (data.role === 'super_admin' || data.role === 'superadmin') {
         navigate('/admin/dashboard');

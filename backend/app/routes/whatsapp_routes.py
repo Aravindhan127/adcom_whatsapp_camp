@@ -14,7 +14,7 @@ logger = logging.getLogger("adcom-api")
 from app.models.whatsapp_chat_model import WhatsAppMessage
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.agent import Agent
-from app.core.security import get_current_user, get_current_user_flexible, RoleChecker, user_has_bypass
+from app.core.security import get_current_user, get_current_user_flexible, RoleChecker, user_has_bypass, PermissionChecker
 from app.services.whatsapp_chat_service import finalize_billing_on_delivery, send_whatsapp_message, verify_whatsapp_token
 from app.services.billing import ensure_conversation
 from app.services.ai_brain import chat_with_knowledge
@@ -61,7 +61,7 @@ def list_conversations(
     search: Optional[str] = Query(None),
     campaign_id: Optional[UUID] = Query(None),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(PermissionChecker("screen.chat"))
 ):
     # Base subquery: Get the latest conversation ID for each UNIQUE phone number (last 10 digits)
     # This is the most robust way to collapse +91, 91, and other variants.
@@ -129,7 +129,7 @@ def get_conversation_messages(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(PermissionChecker("screen.chat"))
 ):
     # Use last 10 digits suffix matching for history to be extra robust
     last_10 = wa_id.replace('+', '').replace(' ', '')[-10:] if len(wa_id) >= 10 else wa_id
@@ -153,7 +153,7 @@ def get_conversation_messages(
 async def send_message_route(
     request: Request,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(PermissionChecker("screen.chat"))
 ):
     data = await request.json()
     to = normalize_wa_id(data.get("to", ""))
@@ -183,7 +183,7 @@ async def send_media_route(
     media_type: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(any_agent)
+    current_user: Agent = Depends(PermissionChecker("screen.chat"))
 ):
     # 0. Normalize phone number (Standardizing for Rule 1 & Rule 5 consistency)
     to = normalize_wa_id(to)

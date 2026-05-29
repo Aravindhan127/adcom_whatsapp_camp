@@ -24,12 +24,17 @@ def init_rbac(db: Session):
             {"name": "Import Contacts", "slug": "contact.import"},
             {"name": "Delete Contacts", "slug": "contact.delete"},
             {"name": "View Contacts", "slug": "contact.view"},
+            # WhatsApp
+            {"name": "Live Chat", "slug": "screen.chat"},
             # Templates
             {"name": "View Templates", "slug": "template.view"},
             {"name": "Manage Templates", "slug": "template.manage"},
             {"name": "Sync Templates", "slug": "template.sync"},
-            # Organizations
+            # Organizations & Users
             {"name": "Manage Organization", "slug": "org.manage"},
+            {"name": "Manage Users", "slug": "user.manage"},
+            {"name": "Manage Roles", "slug": "role.manage"},
+            {"name": "View Audit Logs", "slug": "audit.view"},
             # System
             {"name": "Global Admin", "slug": "system.admin"},
         ]
@@ -59,6 +64,7 @@ def init_rbac(db: Session):
                     db_permissions[s] for s in [
                         "campaign.create", "campaign.start", "campaign.delete", "campaign.view",
                         "contact.manage", "contact.import", "contact.delete", "contact.view",
+                        "screen.chat",
                         "template.manage", "template.sync", "template.view", "org.manage"
                     ]
                 ]
@@ -69,7 +75,7 @@ def init_rbac(db: Session):
                 "can_bypass_isolation": False,
                 "permissions": [
                     db_permissions[s] for s in [
-                        "campaign.view", "campaign.create", "campaign.start", "contact.view", "template.view", "template.manage", "template.sync"
+                        "campaign.view", "campaign.create", "campaign.start", "contact.view", "template.view", "template.manage", "template.sync", "screen.chat"
                     ]
                 ]
             },
@@ -85,11 +91,11 @@ def init_rbac(db: Session):
                 db.flush()
                 logger.info(f"Created role: {role.name}")
             else:
-                # Force update permissions for existing roles
-                role.permissions = permissions
+                # Do NOT force update permissions for existing roles
+                # so that user modifications in the UI are preserved!
                 role.can_bypass_isolation = r.get("can_bypass_isolation", role.can_bypass_isolation)
                 db.flush()
-                logger.info(f"Updated permissions for role: {role.name}")
+                logger.info(f"Verified role: {role.name}")
         
         db.commit()
         

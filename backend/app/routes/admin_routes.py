@@ -17,7 +17,9 @@ router = APIRouter(prefix="/admin", tags=["Super Admin Management"])
 
 # Permissions
 require_system_admin = PermissionChecker("system.admin")
-require_org_manage = PermissionChecker("org.manage")
+require_org_manage = PermissionChecker(["system.admin", "org.manage"])
+require_user_manage = PermissionChecker(["system.admin", "user.manage"])
+require_role_manage = PermissionChecker(["system.admin", "role.manage"])
 
 
 
@@ -313,10 +315,13 @@ def delete_org_custom_field(
 @router.get("/users")
 def list_all_users(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_user_manage)
 ):
-    """List all users across all organizations with role details."""
-    users = db.query(Agent).all()
+    """List users. Org Admins only see their own org's users."""
+    if user_has_bypass(current_user):
+        users = db.query(Agent).all()
+    else:
+        users = db.query(Agent).filter(Agent.organization_id == current_user.organization_id).all()
     results = []
     for u in users:
         results.append({
@@ -338,21 +343,33 @@ def update_user_access(
     user_id: uuid.UUID,
     user_in: UserUpdate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_user_manage)
 ):
     """Change a user's role or organization (Super Admin only)."""
     target_user = db.query(Agent).get(user_id)
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
         
+    if not user_has_bypass(current_user) and target_user.organization_id != current_user.organization_id:
+        raise HTTPException(status_code=403, detail="Cannot manage users outside your organization")
+        
+    if not user_has_bypass(current_user) and target_user.role_obj and target_user.role_obj.can_bypass_isolation:
+        raise HTTPException(status_code=403, detail="Cannot modify users with global isolation bypass privileges")
+        
     if user_in.role_id is not None:
         role = db.query(Role).get(user_in.role_id)
         if not role:
              raise HTTPException(status_code=400, detail="Invalid Role ID")
+             
+        if not user_has_bypass(current_user) and role.can_bypass_isolation:
+             raise HTTPException(status_code=403, detail="Cannot assign roles with global isolation bypass privileges")
+             
         target_user.role_id = role.id
         target_user.role = role.slug # Keep synced
         
     if user_in.organization_id is not None:
+        if not user_has_bypass(current_user) and user_in.organization_id != current_user.organization_id:
+            raise HTTPException(status_code=403, detail="Cannot move users to other organizations")
         org = db.query(Organization).get(user_in.organization_id)
         if not org:
              raise HTTPException(status_code=400, detail="Invalid Organization ID")
@@ -371,12 +388,18 @@ def update_user_access(
 def delete_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_user_manage)
 ):
     """Permanently delete a user account (Super Admin only)."""
     target_user = db.query(Agent).get(user_id)
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+        
+    if not user_has_bypass(current_user) and target_user.organization_id != current_user.organization_id:
+        raise HTTPException(status_code=403, detail="Cannot delete users outside your organization")
+        
+    if not user_has_bypass(current_user) and target_user.role_obj and target_user.role_obj.can_bypass_isolation:
+        raise HTTPException(status_code=403, detail="Cannot delete users with global isolation bypass privileges")
         
     db.delete(target_user)
     db.commit()
@@ -385,11 +408,16 @@ def delete_user(
 @router.get("/roles")
 def list_available_roles(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_role_manage)
 ):
-    """Get list of roles for assignment, including permissions."""
+    """Get list of roles for assignment. Org Admins cannot see bypass roles."""
     from sqlalchemy.orm import joinedload
-    roles = db.query(Role).options(joinedload(Role.permissions)).all()
+    query = db.query(Role).options(joinedload(Role.permissions))
+    
+    if not user_has_bypass(current_user):
+        query = query.filter(Role.can_bypass_isolation == False)
+        
+    roles = query.all()
     results = []
     for r in roles:
         results.append({
@@ -406,7 +434,7 @@ def list_available_roles(
 def create_role(
     role_in: RoleCreate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_role_manage)
 ):
     """Create a new custom role."""
     if db.query(Role).filter(Role.slug == role_in.slug).first():
@@ -425,7 +453,7 @@ def create_role(
 @router.get("/permissions")
 def list_permissions(
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_role_manage)
 ):
     """List all available permissions, grouped by module."""
     perms = db.query(Permission).all()
@@ -447,7 +475,7 @@ def update_role_permissions(
     role_id: uuid.UUID,
     perms_in: RolePermissionsUpdate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_role_manage)
 ):
     """Update permissions assigned to a role."""
     role = db.query(Role).filter(Role.id == role_id).first()
@@ -458,28 +486,33 @@ def update_role_permissions(
     if len(permissions) != len(perms_in.permission_ids):
         raise HTTPException(status_code=400, detail="One or more invalid permission IDs")
         
+    # Update the permissions relationship
     role.permissions = permissions
-    
-    # SECURITY: Invalidate sessions for ALL users with this role
-    # so permission changes take effect immediately platform-wide.
-    db.query(Agent).filter(Agent.role_id == role.id).update(
-        {Agent.token_version: Agent.token_version + 1},
-        synchronize_session=False
-    )
+        
+    # SECURITY: Invalidate tokens for all users of this role so permissions apply immediately,
+    # EXCEPT for the current user who made the change, so they aren't unceremoniously logged out.
+    # The frontend is responsible for fetching fresh permissions via /auth/me for the current user.
+    users_with_role = db.query(Agent).filter(Agent.role_id == role.id).all()
+    for u in users_with_role:
+        if u.id != current_user.id:
+            u.token_version += 1
     
     db.commit()
-    return {"message": f"Role permissions updated. Sessions for all {role.name}s invalidated."}
+    return {"message": f"Role permissions updated. Sessions for all other {role.name}s invalidated."}
 
 @router.post("/users/{user_id}/impersonate")
 def impersonate_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_user_manage)
 ):
     """Generate an access token to impersonate another user (Super Admin only)."""
     target_user = db.query(Agent).get(user_id)
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+        
+    if not user_has_bypass(current_user) and target_user.organization_id != current_user.organization_id:
+        raise HTTPException(status_code=403, detail="Cannot impersonate users outside your organization")
         
     # Prevent impersonating users who can bypass isolation (other Super Admins)
     if target_user.role_obj and target_user.role_obj.can_bypass_isolation:
@@ -503,15 +536,18 @@ def impersonate_user(
     }
 
 @router.post("/users/{user_id}/force-logout")
-def force_logout_user(
+def force_logout(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(require_system_admin)
+    current_user: Agent = Depends(require_user_manage)
 ):
     """Invalidate all active sessions for a user by incrementing token_version."""
     target_user = db.query(Agent).get(user_id)
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+        
+    if not user_has_bypass(current_user) and target_user.organization_id != current_user.organization_id:
+        raise HTTPException(status_code=403, detail="Cannot force logout users outside your organization")
         
     target_user.token_version += 1
     db.commit()

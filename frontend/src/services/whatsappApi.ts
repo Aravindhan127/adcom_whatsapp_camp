@@ -142,6 +142,20 @@ export interface FieldConfig {
     options?: string[];
 }
 
+export interface InteractiveFlow {
+    id: string;
+    name: string;
+    trigger_keyword: string;
+    response_type: 'text' | 'template';
+    response_text?: string | null;
+    response_template?: string | null;
+    variable_values?: Record<string, any> | null;
+    organization_id?: string;
+    is_active: boolean;
+    created_at?: string;
+    updated_at?: string;
+}
+
 // ──────────────────────────────────────────────────────────────
 // API methods
 // ──────────────────────────────────────────────────────────────
@@ -154,7 +168,7 @@ export const whatsappApi = {
         const res = await whatsappClient.post('/api/auth/login', formData, {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
         });
-        return res.data as { access_token: string; token_type: string; role: string; username: string };
+        return res.data as { access_token: string; token_type: string; role: string; username: string; permissions: string[] };
     },
 
     registerAgent: async (payload: { username: string; email: string; password: string; full_name?: string; role: string; organization_id?: string | null }) => {
@@ -170,6 +184,11 @@ export const whatsappApi = {
     resetPassword: async (token: string, newPassword: string) => {
         const res = await whatsappClient.post('/api/auth/reset-password', { token, new_password: newPassword });
         return res.data;
+    },
+
+    getMe: async () => {
+        const res = await whatsappClient.get('/api/auth/me');
+        return res.data as { id: string; username: string; email: string; role: string; organization_id: string | null; permissions: string[] };
     },
 
     // ── Conversations ─────────────────────────────────────────
@@ -304,7 +323,7 @@ export const whatsappApi = {
         limit?: number;
         sort_by?: string;
         sort_order?: string;
-    }): Promise<{ total: number; items: Template[] }> => {
+    }): Promise<{ total: number; items: Template[]; status_counts?: { APPROVED: number; PENDING: number; REJECTED: number } }> => {
         const res = await whatsappClient.get('/api/templates/', { params });
         // Robustness: Handle if backend still returns an array instead of paginated object
         if (Array.isArray(res.data)) {
@@ -312,7 +331,8 @@ export const whatsappApi = {
         }
         return {
             total: res.data?.total || 0,
-            items: res.data?.items || []
+            items: res.data?.items || [],
+            status_counts: res.data?.status_counts
         };
     },
 
@@ -592,6 +612,30 @@ export const whatsappApi = {
 
     deleteCustomField: async (orgId: string, fieldName: string) => {
         const res = await whatsappClient.delete(`/api/admin/system/organizations/${orgId}/fields/${fieldName}`);
+        return res.data;
+    },
+
+    // ── Interactive Flows ─────────────────────────────────────
+    getFlows: async (params?: { skip?: number; limit?: number; search?: string }): Promise<{ items: InteractiveFlow[]; total: number }> => {
+        const res = await whatsappClient.get('/api/flows/', { params });
+        return {
+            items: res.data.items || [],
+            total: res.data.total || 0
+        };
+    },
+
+    createFlow: async (payload: Partial<InteractiveFlow>): Promise<InteractiveFlow> => {
+        const res = await whatsappClient.post('/api/flows/', payload);
+        return res.data;
+    },
+
+    updateFlow: async (id: string, payload: Partial<InteractiveFlow>): Promise<InteractiveFlow> => {
+        const res = await whatsappClient.put(`/api/flows/${id}`, payload);
+        return res.data;
+    },
+
+    deleteFlow: async (id: string) => {
+        const res = await whatsappClient.delete(`/api/flows/${id}`);
         return res.data;
     },
 };

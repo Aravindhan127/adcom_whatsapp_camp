@@ -10,6 +10,7 @@ from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.audit_log import AuditLog
 from app.models.organization import Organization, OrganizationConfig, ContactFieldConfig
 from app.models.rbac import Role, Permission, role_permissions
+from app.models.interactive_flow import InteractiveFlow
 
 __all__ = [
     "Base",
@@ -26,4 +27,5 @@ __all__ = [
     "Organization",
     "OrganizationConfig",
     "ContactFieldConfig",
+    "InteractiveFlow",
 ]
